@@ -1,0 +1,8 @@
+*.db
+*.db-wal
+*.db-shm
+store-engine
+store-engine-android
+app
+engine
+.env
