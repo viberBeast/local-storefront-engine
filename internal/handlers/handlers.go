@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,14 +10,14 @@ import (
 	"local-storefront-engine/internal/storage"
 )
 
-type OrderItem struct {
+type ClientOrderItem struct {
 	ProductID string `json:"product_id"`
 	Quantity  int    `json:"quantity"`
 }
 
 type checkoutPayload struct {
-	UserEmail string      `json:"user_email"`
-	Items     []OrderItem `json:"items"`
+	UserEmail string            `json:"user_email"`
+	Items     []ClientOrderItem `json:"items"`
 }
 
 type Handler struct {
@@ -62,8 +61,13 @@ func (h *Handler) GetProductsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dbConn := h.DB.(*sql.DB)
-	products, err := storage.GetAllProducts(r.Context(), dbConn)
+	dbWrapper, ok := h.DB.(*storage.DB)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "invalid database connection driver type")
+		return
+	}
+
+	products, err := dbWrapper.GetAllProducts()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to retrieve products")
 		return
@@ -72,11 +76,8 @@ func (h *Handler) GetProductsHandler(w http.ResponseWriter, r *http.Request) {
 		products = []storage.Product{}
 	}
 
-	// ── DYNAMIC IMAGE ASSET MAPPING ────────────────────────────────────
-	// Computes clean asset path slugs based on lowercase product names
 	for i := range products {
 		if products[i].ImageURL == "" {
-			// Convert "IWC BIG PILOT'S WATCH" -> "iwc-big-pilot-s-watch"
 			cleanName := strings.ToLower(products[i].Name)
 			cleanName = strings.ReplaceAll(cleanName, " ", "-")
 			cleanName = strings.ReplaceAll(cleanName, "'", "-")
@@ -85,14 +86,10 @@ func (h *Handler) GetProductsHandler(w http.ResponseWriter, r *http.Request) {
 			cleanName = strings.ReplaceAll(cleanName, "(", "")
 			cleanName = strings.ReplaceAll(cleanName, ")", "")
 			cleanName = strings.ReplaceAll(cleanName, "--", "-")
-			
-			// Trim trailing or double dashes from formatting sanitization
 			cleanName = strings.Trim(cleanName, "-")
 			
-			// Map to your mounted dynamic disk folder route
 			products[i].ImageURL = "/images/" + cleanName + ".png"
 			
-			// Hardcode standard static fallback items if IDs match
 			if products[i].ID == "p1" {
 				products[i].ImageURL = "/images/brutalist-steel-chair.png"
 			} else if products[i].ID == "p2" {
@@ -113,37 +110,56 @@ func (h *Handler) PlaceOrderHandler(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &payload) {
 		return
 	}
-	if strings.TrimSpace(payload.UserEmail) == "" || len(payload.Items) == 0 {
-		writeError(w, http.StatusUnprocessableEntity, "invalid email or empty items list")
+	if len(payload.Items) == 0 {
+		writeError(w, http.StatusUnprocessableEntity, "empty items list context validation")
 		return
 	}
 
-	var dbItems []storage.OrderItem
+	dbWrapper, ok := h.DB.(*storage.DB)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "invalid database connection driver type")
+		return
+	}
+
+	var orderItems []storage.OrderItem
 	var totalAmount int
+
 	for _, item := range payload.Items {
-		dbItems = append(dbItems, storage.OrderItem{
+		prod, err := dbWrapper.GetProductByID(item.ProductID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "product validation failed: "+item.ProductID)
+			return
+		}
+
+		if prod.Stock < item.Quantity {
+			writeError(w, http.StatusBadRequest, "insufficient inventory context for product: "+item.ProductID)
+			return
+		}
+
+		totalAmount += prod.Price * item.Quantity
+
+		orderItems = append(orderItems, storage.OrderItem{
 			ProductID: item.ProductID,
 			Quantity:  item.Quantity,
-			Price:     0,
+			Price:     prod.Price,
 		})
 	}
 
 	orderId := "ord_" + string(time.Now().UnixNano())
 	order := storage.Order{
-		ID:          orderId,
-		UserEmail:   payload.UserEmail,
-		TotalAmount: totalAmount,
-		Status:      "pending",
-		CreatedAt:   time.Now().UTC(),
+		ID:        orderId,
+		CreatedAt: time.Now().UTC(),
+		Items:     orderItems,
+		Total:     totalAmount,
+		Status:    "Pending",
 	}
 
-	dbConn := h.DB.(*sql.DB)
-	err := storage.CreateOrder(r.Context(), dbConn, order, dbItems)
+	err := dbWrapper.CreateOrder(order)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to build order record")
+		writeError(w, http.StatusInternalServerError, "failed saving order timeline profile")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"id": orderId, "status": "pending"})
+	writeJSON(w, http.StatusCreated, map[string]string{"id": orderId, "status": "Pending"})
 }
 
 func (h *Handler) GetUserOrdersHandler(w http.ResponseWriter, r *http.Request) {
@@ -151,22 +167,16 @@ func (h *Handler) GetUserOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	email := r.URL.Query().Get("q")
-	if email == "" {
-		cookie, err := r.Cookie("auth_token")
-		if err == nil {
-			email = cookie.Value
-		}
-	}
-	if strings.TrimSpace(email) == "" {
-		writeError(w, http.StatusUnauthorized, "missing email context parameter")
+
+	dbWrapper, ok := h.DB.(*storage.DB)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "invalid database connection driver type")
 		return
 	}
 
-	dbConn := h.DB.(*sql.DB)
-	orders, err := storage.GetOrdersByUser(r.Context(), dbConn, email)
+	orders, err := dbWrapper.GetAllOrders()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load customer records")
+		writeError(w, http.StatusInternalServerError, "failed to load store orders")
 		return
 	}
 	if orders == nil {
@@ -177,7 +187,7 @@ func (h *Handler) GetUserOrdersHandler(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) AdminUpdateInventoryHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPatch {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeError(w, http.StatusMethodNotAllowed, "method notAllowed")
 		return
 	}
 	token := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
@@ -193,11 +203,24 @@ func (h *Handler) AdminUpdateInventoryHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	dbConn := h.DB.(*sql.DB)
-	err := storage.AdminUpdateStock(r.Context(), dbConn, mutation.ProductID, mutation.Stock)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed updating inventory limits")
+	dbWrapper, ok := h.DB.(*storage.DB)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "invalid database connection driver type")
 		return
 	}
+
+	prod, err := dbWrapper.GetProductByID(mutation.ProductID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "target variant item entry missing")
+		return
+	}
+
+	prod.Stock = mutation.Stock
+	err = dbWrapper.UpdateProduct(prod)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed applying production scale threshold modifications")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "inventory update applied successfully"})
 }

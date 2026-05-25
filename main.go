@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"embed"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"local-storefront-engine/internal/handlers"
-	"local-storefront-engine/internal/router"
 	"local-storefront-engine/internal/storage"
 )
 
@@ -20,7 +19,7 @@ import (
 var embeddedFiles embed.FS
 
 func main() {
-	log.Println("Starting Storefront Engine Lifecycle Manager...")
+	log.Println("Starting Dual-Channel Storefront Security Manager...")
 
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
@@ -30,17 +29,22 @@ func main() {
 	if adminToken == "" {
 		adminToken = "super-secret-dev-token"
 	}
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+
+	publicPort := os.Getenv("PUBLIC_PORT")
+	if publicPort == "" {
+		publicPort = "8080"
+	}
+	privatePort := os.Getenv("PRIVATE_PORT")
+	if privatePort == "" {
+		privatePort = "8081"
 	}
 
-	db, err := storage.InitDB(dbPath)
+	db, err := storage.Open(context.Background(), dbPath)
 	if err != nil {
 		log.Fatalf("Fatal database initialization error: %v", err)
 	}
 	defer db.Close()
-	log.Printf("SQLite storage layer initialized successfully at: %s", dbPath)
+	log.Printf("SQLite layer active at: %s", dbPath)
 
 	seedDatabaseIfPristine(db)
 
@@ -49,65 +53,108 @@ func main() {
 		log.Fatalf("Fatal handler instantiation error: %v", err)
 	}
 
-	appRouter := router.NewRouter(h, embeddedFiles)
+	webFS, err := fs.Sub(embeddedFiles, "web")
+	if err != nil {
+		log.Fatalf("Fatal embedded root sub-tree generation mismatch: %v", err)
+	}
+	staticFileServer := http.FileServer(http.FS(webFS))
 
-	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      appRouter,
+	// ==========================================
+	// 1. PUBLIC ROUTER DEFINITION (Customer facing)
+	// ==========================================
+	publicMux := http.NewServeMux()
+	
+	publicMux.Handle("/", staticFileServer)
+	publicMux.Handle("/static/", staticFileServer)
+	publicMux.Handle("/images/", staticFileServer)
+	
+	publicMux.HandleFunc("/api/products", h.GetProductsHandler)
+	publicMux.HandleFunc("/api/checkout", h.PlaceOrderHandler)
+	publicMux.HandleFunc("/api/orders", h.GetUserOrdersHandler)
+
+	publicServer := &http.Server{
+		Addr:         "0.0.0.0:" + publicPort,
+		Handler:      publicMux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
 	}
 
-	shutdownChan := make(chan os.Signal, 1)
-	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+	// ==========================================
+	// 2. PRIVATE ROUTER DEFINITION (LAN-locked Admin)
+	// ==========================================
+	privateMux := http.NewServeMux()
+	
+	privateMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		adminHTML, err := embeddedFiles.ReadFile("web/admin.html")
+		if err != nil {
+			http.Error(w, "Administrative assets payload missing internal embed layout", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(adminHTML)
+	})
+
+	// Mount the handler locally on port 8081 to bypass CORS entirely
+	privateMux.HandleFunc("/api/products", h.GetProductsHandler)
+	privateMux.HandleFunc("/admin/api/inventory", h.AdminUpdateInventoryHandler)
+
+	privateServer := &http.Server{
+		Addr:         "127.0.0.1:" + privatePort,
+		Handler:      privateMux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
 
 	go func() {
-		log.Printf("Storefront Engine online! Point your browser to http://localhost:%s", port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Critical network listening issue: %v", err)
+		log.Printf("[PUBLIC ACCESS ONLINE] Storefront serving on http://0.0.0.0:%s", publicPort)
+		if err := publicServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Critical Public Server network failure: %v", err)
 		}
 	}()
 
-	<-shutdownChan
-	log.Println("Shutdown signal received. Wrapping up ongoing tasks and closing database pools gracefully...")
+	go func() {
+		log.Printf("[PRIVATE ADMIN ONLINE] Core control interface active at http://127.0.0.1:%s", privatePort)
+		if err := privateServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Critical Private Server network failure: %v", err)
+		}
+	}()
 
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+	<-shutdownChan
+	
+	log.Println("Intercept caught. Shutting down active web pools safely...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to close with active leaks: %v", err)
-	}
+	_ = publicServer.Shutdown(ctx)
+	_ = privateServer.Shutdown(ctx)
 
-	log.Println("Storefront runtime closed down cleanly.")
+	log.Println("Both network engine channels terminated cleanly.")
 }
 
-func seedDatabaseIfPristine(db *sql.DB) {
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM products").Scan(&count)
-	if err != nil || count > 0 {
+func seedDatabaseIfPristine(db *storage.DB) {
+	products, err := db.GetAllProducts()
+	if err != nil || len(products) > 0 {
 		return
 	}
 
 	log.Println("Empty database discovered! Inserting brutalist catalog essentials...")
 
-	seeds := []struct {
-		ID    string
-		Name  string
-		Desc  string
-		Price int
-		Stock int
-	}{
-		{"p1", "Brutalist Steel Chair", "Raw sandblasted raw steel framing. Ergonomically uncompromising.", 45000, 10},
-		{"p2", "Concrete Desk Lamp", "Cast basaltic concrete block housing a single high-temperature amber halogen beam.", 12000, 24},
-		{"p3", "Monolithic Wool Rug", "Heavy-gauge un-dyed basalt gray wool weave. Heavy weave density.", 8500, 5},
+	seeds := []storage.Product{
+		{ID: "p1", Name: "Brutalist Steel Chair", Description: "Raw sandblasted raw steel framing. Ergonomically uncompromising.", Price: 45000, Stock: 10, Category: "ACCESSORIES"},
+		{ID: "p2", Name: "Concrete Desk Lamp", Description: "Cast basaltic concrete block housing a single high-temperature amber halogen beam.", Price: 12000, Stock: 24, Category: "ACCESSORIES"},
+		{ID: "p3", Name: "Monolithic Wool Rug", Description: "Heavy-gauge un-dyed basalt gray wool weave. Heavy weave density.", Price: 8500, Stock: 5, Category: "ACCESSORIES"},
 	}
 
 	for _, item := range seeds {
-		_, _ = db.Exec(`
-			INSERT INTO products (id, name, description, price, stock) 
-			VALUES (?, ?, ?, ?, ?)`,
-			item.ID, item.Name, item.Desc, item.Price, item.Stock,
-		)
+		if err := db.CreateProduct(item); err != nil {
+			log.Printf("Warning: Failed to seed product %s: %v", item.ID, err)
+		}
 	}
 }

@@ -1,4 +1,4 @@
-=== CODEBASE SNAPSHOT GENERATED ON Sat May 23 06:42:12 PM IST 2026 ===
+=== CODEBASE SNAPSHOT GENERATED ON Mon May 25 11:11:07 PM IST 2026 ===
 
 === PROJECT DIRECTORY STRUCTURE ===
 .
@@ -14,6 +14,7 @@
 │       └── database.go
 ├── main.go
 ├── snapshot.sh
+├── storefront-engine
 └── web
     ├── index.html
     ├── public
@@ -22,7 +23,7 @@
     └── static
         └── style.css
 
-8 directories, 12 files
+8 directories, 13 files
 
 === SOURCE FILE CONTENTS ===
 
@@ -48,11 +49,12 @@ import (
 
 // Product represents a sellable item in the catalogue.
 type Product struct {
-	ID          string
-	Name        string
-	Description string
-	Price       int // stored in smallest currency unit (e.g. paise / cents)
-	Stock       int
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Price       int    `json:"price"`
+	Stock       int    `json:"stock"`
+	ImageURL    string `json:"image_url"`
 }
 
 // Order represents a customer purchase header.
@@ -387,6 +389,36 @@ func (h *Handler) GetProductsHandler(w http.ResponseWriter, r *http.Request) {
 	if products == nil {
 		products = []storage.Product{}
 	}
+
+	// ── DYNAMIC IMAGE ASSET MAPPING ────────────────────────────────────
+	// Computes clean asset path slugs based on lowercase product names
+	for i := range products {
+		if products[i].ImageURL == "" {
+			// Convert "IWC BIG PILOT'S WATCH" -> "iwc-big-pilot-s-watch"
+			cleanName := strings.ToLower(products[i].Name)
+			cleanName = strings.ReplaceAll(cleanName, " ", "-")
+			cleanName = strings.ReplaceAll(cleanName, "'", "-")
+			cleanName = strings.ReplaceAll(cleanName, "\"", "-")
+			cleanName = strings.ReplaceAll(cleanName, "/", "-")
+			cleanName = strings.ReplaceAll(cleanName, "(", "")
+			cleanName = strings.ReplaceAll(cleanName, ")", "")
+			cleanName = strings.ReplaceAll(cleanName, "--", "-")
+			
+			// Trim trailing or double dashes from formatting sanitization
+			cleanName = strings.Trim(cleanName, "-")
+			
+			// Map to your mounted dynamic disk folder route
+			products[i].ImageURL = "/images/" + cleanName + ".png"
+			
+			// Hardcode standard static fallback items if IDs match
+			if products[i].ID == "p1" {
+				products[i].ImageURL = "/images/brutalist-steel-chair.png"
+			} else if products[i].ID == "p2" {
+				products[i].ImageURL = "/images/concrete-desk-lamp.png"
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, products)
 }
 
@@ -527,7 +559,6 @@ func NewRouter(h *handlers.Handler, embeddedFiles embed.FS) http.Handler {
 	})
 
 	// ── STYLESHEET INTERCEPTOR ────────────────────────────────────────────
-	// Intercepts the root style.css request and serves it safely from public
 	r.Get("/style.css", func(w http.ResponseWriter, r *http.Request) {
 		cssBytes, err := embeddedFiles.ReadFile("web/public/style.css")
 		if err != nil {
@@ -547,6 +578,11 @@ func NewRouter(h *handlers.Handler, embeddedFiles embed.FS) http.Handler {
 
 		r.Patch("/admin/inventory", h.AdminUpdateInventoryHandler)
 	})
+
+	// ── LIVE ASSETS FROM DISK (ADORN TAP / YEEZY IMAGES) ──────────────────
+	// Serves files from disk dynamically instead of embedding heavy binaries
+	imageDir := "/home/somo/adorntap_raw_data/images"
+	r.Handle("/images/*", http.StripPrefix("/images", http.FileServer(http.Dir(imageDir))))
 
 	// ── STATIC EMBEDDED PATH MAPPINGS ──────────────────────────────────────
 	mountStaticDir(r, embeddedFiles, "/public", "web/public")

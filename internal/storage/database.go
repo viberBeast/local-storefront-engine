@@ -11,10 +11,6 @@ import (
 	_ "modernc.org/sqlite" // Pure-Go SQLite driver; registers as "sqlite"
 )
 
-// ─────────────────────────────────────────────
-// Domain structs
-// ─────────────────────────────────────────────
-
 // Product represents a sellable item in the catalogue.
 type Product struct {
 	ID          string `json:"id"`
@@ -23,260 +19,232 @@ type Product struct {
 	Price       int    `json:"price"`
 	Stock       int    `json:"stock"`
 	ImageURL    string `json:"image_url"`
+	Category    string `json:"category"`   // GARMENTS, FOOTWEAR, ACCESSORIES
+	SortOrder   int    `json:"sort_order"` // Manual feed priority
 }
 
-// Order represents a customer purchase header.
+// Order represents a completed customer purchase.
 type Order struct {
-	ID          string
-	UserEmail   string
-	TotalAmount int // smallest currency unit
-	Status      string
-	CreatedAt   time.Time
+	ID        string      `json:"id"`
+	CreatedAt time.Time   `json:"created_at"`
+	Items     []OrderItem `json:"items"`
+	Total     int         `json:"total"`
+	Status    string      `json:"status"` // Pending, Shipped, Cancelled
 }
 
-// OrderItem is a single line inside an Order.
+// OrderItem maps individual product quantities within an order.
 type OrderItem struct {
-	ID        int
-	OrderID   string
-	ProductID string
-	Quantity  int
-	Price     int // unit price at time of purchase
+	ProductID   string `json:"product_id"`
+	ProductName string `json:"product_name"`
+	Quantity    int    `json:"quantity"`
+	Price       int    `json:"price"`
 }
 
-// ─────────────────────────────────────────────
-// Initialisation
-// ─────────────────────────────────────────────
+// DB wraps the standard *sql.DB connection pool.
+type DB struct {
+	Ctx context.Context
+	*sql.DB
+}
 
-// InitDB opens (or creates) the SQLite database at dbPath, applies the
-// recommended WAL pragmas for high-concurrency workloads, and creates the
-// required tables if they do not yet exist.
-//
-// Connection-string pragmas used:
-//   - journal_mode=WAL  – enables concurrent readers + one writer
-//   - busy_timeout=5000 – wait up to 5 s before returning SQLITE_BUSY
-//
-// MaxOpenConns is set to 1 to serialise all writes through a single
-// connection and avoid "database is locked" errors that would otherwise
-// occur with multiple concurrent write connections to SQLite.
-func InitDB(dbPath string) (*sql.DB, error) {
-	dsn := fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
-		dbPath,
-	)
-
+// Open initializes the SQLite database engine file and builds default schemas.
+func Open(ctx context.Context, dsn string) (*DB, error) {
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("storage.InitDB: open: %w", err)
+		return nil, fmt.Errorf("failed to open sqlite pool: %w", err)
 	}
 
-	// Serialise writes; SQLite supports only one concurrent writer.
+	// Optimize transactional execution overhead
 	db.SetMaxOpenConns(1)
 
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("storage.InitDB: ping: %w", err)
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("failed to ping sqlite pool: %w", err)
 	}
 
-	if err := createSchema(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("storage.InitDB: schema: %w", err)
+	instance := &DB{Ctx: ctx, DB: db}
+	if err := instance.createSchema(); err != nil {
+		return nil, fmt.Errorf("failed to build internal schemas: %w", err)
 	}
 
-	return db, nil
+	return instance, nil
 }
 
-// createSchema runs the DDL statements that set up the three core tables.
-// All statements use IF NOT EXISTS so they are safe to run on every start-up.
-func createSchema(db *sql.DB) error {
+func (db *DB) createSchema() error {
 	const ddl = `
 	CREATE TABLE IF NOT EXISTS products (
 		id          TEXT PRIMARY KEY,
 		name        TEXT    NOT NULL,
 		description TEXT    NOT NULL DEFAULT '',
 		price       INTEGER NOT NULL CHECK (price >= 0),
-		stock       INTEGER NOT NULL CHECK (stock >= 0)
+		stock       INTEGER NOT NULL CHECK (stock >= 0),
+		image_url   TEXT    NOT NULL DEFAULT '',
+		category    TEXT    NOT NULL DEFAULT 'GARMENTS',
+		sort_order  INTEGER NOT NULL DEFAULT 0
 	);
 
 	CREATE TABLE IF NOT EXISTS orders (
-		id           TEXT    PRIMARY KEY,
-		user_email   TEXT    NOT NULL,
-		total_amount INTEGER NOT NULL CHECK (total_amount >= 0),
-		status       TEXT    NOT NULL DEFAULT 'pending',
-		created_at   TEXT    NOT NULL  -- stored as RFC3339 string
+		id          TEXT PRIMARY KEY,
+		created_at  TEXT NOT NULL,
+		total       INTEGER NOT NULL,
+		status      TEXT NOT NULL DEFAULT 'Pending'
 	);
 
 	CREATE TABLE IF NOT EXISTS order_items (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		order_id   TEXT    NOT NULL REFERENCES orders(id)   ON DELETE CASCADE,
-		product_id TEXT    NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
-		quantity   INTEGER NOT NULL CHECK (quantity > 0),
-		price      INTEGER NOT NULL CHECK (price >= 0)
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		order_id    TEXT NOT NULL,
+		product_id  TEXT NOT NULL,
+		quantity    INTEGER NOT NULL CHECK (quantity > 0),
+		price       INTEGER NOT NULL CHECK (price >= 0),
+		FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
 	);
-
-	CREATE INDEX IF NOT EXISTS idx_orders_user_email   ON orders(user_email);
-	CREATE INDEX IF NOT EXISTS idx_order_items_order   ON order_items(order_id);
-	CREATE INDEX IF NOT EXISTS idx_order_items_product ON order_items(product_id);
 	`
-
-	if _, err := db.Exec(ddl); err != nil {
-		return err
-	}
-	return nil
+	_, err := db.ExecContext(db.Ctx, ddl)
+	return err
 }
 
-// ─────────────────────────────────────────────
-// Query functions
-// ─────────────────────────────────────────────
-
-// GetAllProducts returns every product row from the database, ordered by name.
-// The caller supplies a context so the query can be cancelled or time-boxed.
-func GetAllProducts(ctx context.Context, db *sql.DB) ([]Product, error) {
-	const q = `
-		SELECT id, name, description, price, stock
-		FROM   products
-		ORDER  BY name ASC`
-
-	rows, err := db.QueryContext(ctx, q)
+// GetAllProducts fetches store rows ordered intelligently by stock state and curation sequences.
+func (db *DB) GetAllProducts() ([]Product, error) {
+	const query = `
+		SELECT id, name, description, price, stock, image_url, category, sort_order 
+		FROM products 
+		ORDER BY CASE WHEN stock > 0 THEN 0 ELSE 1 END ASC, sort_order ASC, id DESC
+	`
+	rows, err := db.QueryContext(db.Ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("storage.GetAllProducts: query: %w", err)
+		return nil, err
 	}
 	defer rows.Close()
 
 	var products []Product
 	for rows.Next() {
 		var p Product
-		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Stock); err != nil {
-			return nil, fmt.Errorf("storage.GetAllProducts: scan: %w", err)
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Stock, &p.ImageURL, &p.Category, &p.SortOrder); err != nil {
+			return nil, err
 		}
 		products = append(products, p)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("storage.GetAllProducts: rows: %w", err)
-	}
-
 	return products, nil
 }
 
-// CreateOrder inserts an Order header and all its OrderItems inside a single
-// ACID-compliant transaction.  The transaction is automatically rolled back if
-// any step fails; otherwise it is committed before returning.
-//
-// Note: order.CreatedAt is serialised to RFC3339 because SQLite has no native
-// DATETIME type; it is deserialised back to time.Time in GetOrdersByUser.
-func CreateOrder(ctx context.Context, db *sql.DB, order Order, items []OrderItem) error {
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	if err != nil {
-		return fmt.Errorf("storage.CreateOrder: begin tx: %w", err)
+// GetProductByID extracts a single targeted identifier match from SQLite.
+func (db *DB) GetProductByID(id string) (Product, error) {
+	const query = `SELECT id, name, description, price, stock, image_url, category, sort_order FROM products WHERE id = ?`
+	var p Product
+	err := db.QueryRowContext(db.Ctx, query, id).Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Stock, &p.ImageURL, &p.Category, &p.SortOrder)
+	if err == sql.ErrNoRows {
+		return p, fmt.Errorf("item mapping index target not located: %s", id)
 	}
-	// Ensure the transaction is always resolved – rolled back on any error path.
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
-	// 1. Insert the order header.
-	const insertOrder = `
-		INSERT INTO orders (id, user_email, total_amount, status, created_at)
-		VALUES             (?,  ?,          ?,            ?,      ?         )`
-
-	if _, err = tx.ExecContext(ctx, insertOrder,
-		order.ID,
-		order.UserEmail,
-		order.TotalAmount,
-		order.Status,
-		order.CreatedAt.UTC().Format(time.RFC3339),
-	); err != nil {
-		return fmt.Errorf("storage.CreateOrder: insert order: %w", err)
-	}
-
-	// 2. Insert each line item.
-	const insertItem = `
-		INSERT INTO order_items (order_id, product_id, quantity, price)
-		VALUES                  (?,        ?,          ?,        ?    )`
-
-	for i, item := range items {
-		if _, err = tx.ExecContext(ctx, insertItem,
-			order.ID,
-			item.ProductID,
-			item.Quantity,
-			item.Price,
-		); err != nil {
-			return fmt.Errorf("storage.CreateOrder: insert item[%d]: %w", i, err)
-		}
-	}
-
-	// 3. Commit; any error here is surfaced to the caller.
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("storage.CreateOrder: commit: %w", err)
-	}
-	return nil
+	return p, err
 }
 
-// GetOrdersByUser returns all orders placed by the given email address,
-// sorted newest-first.  created_at is parsed from its RFC3339 storage form
-// back into a time.Time value.
-func GetOrdersByUser(ctx context.Context, db *sql.DB, email string) ([]Order, error) {
-	const q = `
-		SELECT id, user_email, total_amount, status, created_at
-		FROM   orders
-		WHERE  user_email = ?
-		ORDER  BY created_at DESC`
+// CreateProduct writes a new product item node into the core timeline sequence.
+func (db *DB) CreateProduct(p Product) error {
+	const query = `INSERT INTO products (id, name, description, price, stock, image_url, category, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := db.ExecContext(db.Ctx, query, p.ID, p.Name, p.Description, p.Price, p.Stock, p.ImageURL, p.Category, p.SortOrder)
+	return err
+}
 
-	rows, err := db.QueryContext(ctx, q, email)
+// UpdateProduct mutates transactional operational parameters on an existing entry item.
+func (db *DB) UpdateProduct(p Product) error {
+	const query = `UPDATE products SET name = ?, description = ?, price = ?, stock = ?, image_url = ?, category = ?, sort_order = ? WHERE id = ?`
+	_, err := db.ExecContext(db.Ctx, query, p.Name, p.Description, p.Price, p.Stock, p.ImageURL, p.Category, p.SortOrder, p.ID)
+	return err
+}
+
+// DeleteProduct purges an item index pointer completely from the catalog store.
+func (db *DB) DeleteProduct(id string) error {
+	const query = `DELETE FROM products WHERE id = ?`
+	_, err := db.ExecContext(db.Ctx, query, id)
+	return err
+}
+
+// CreateOrder processes customer acquisition bundles securely into local records.
+func (db *DB) CreateOrder(o Order) error {
+	tx, err := db.BeginTx(db.Ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("storage.GetOrdersByUser: query: %w", err)
+		return err
+	}
+	defer tx.Rollback()
+
+	const insertOrder = `INSERT INTO orders (id, created_at, total, status) VALUES (?, ?, ?, ?)`
+	_, err = tx.ExecContext(db.Ctx, insertOrder, o.ID, o.CreatedAt.Format(time.RFC3339), o.Total, o.Status)
+	if err != nil {
+		return err
+	}
+
+	const insertItem = `INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)`
+	const updateStock = `UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?`
+
+	for _, item := range o.Items {
+		_, err = tx.ExecContext(db.Ctx, insertItem, o.ID, item.ProductID, item.Quantity, item.Price)
+		if err != nil {
+			return err
+		}
+
+		res, err := tx.ExecContext(db.Ctx, updateStock, item.Quantity, item.ProductID, item.Quantity)
+		if err != nil {
+			return err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return fmt.Errorf("insufficient items available inside pipeline for ID: %s", item.ProductID)
+		}
+	}
+	return tx.Commit()
+}
+
+// GetAllOrders maps processing client records back into the main view monitor panel.
+func (db *DB) GetAllOrders() ([]Order, error) {
+	const query = `SELECT id, created_at, total, status FROM orders ORDER BY created_at DESC`
+	rows, err := db.QueryContext(db.Ctx, query)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 
 	var orders []Order
 	for rows.Next() {
 		var o Order
-		var createdAtStr string
-
-		if err := rows.Scan(
-			&o.ID, &o.UserEmail, &o.TotalAmount, &o.Status, &createdAtStr,
-		); err != nil {
-			return nil, fmt.Errorf("storage.GetOrdersByUser: scan: %w", err)
+		var timeStr string
+		if err := rows.Scan(&o.ID, &timeStr, &o.Total, &o.Status); err != nil {
+			return nil, err
 		}
+		o.CreatedAt, _ = time.Parse(time.RFC3339, timeStr)
 
-		// Parse the RFC3339 string back to time.Time.
-		o.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
+		itemsQuery := `
+			SELECT oi.product_id, p.name, oi.quantity, oi.price 
+			FROM order_items oi
+			LEFT JOIN products p ON oi.product_id = p.id
+			WHERE oi.order_id = ?`
+		itemRows, err := db.QueryContext(db.Ctx, itemsQuery, o.ID)
 		if err != nil {
-			return nil, fmt.Errorf("storage.GetOrdersByUser: parse time %q: %w", createdAtStr, err)
+			return nil, err
 		}
 
+		for itemRows.Next() {
+			var oi OrderItem
+			var nameNull sql.NullString
+			if err := itemRows.Scan(&oi.ProductID, &nameNull, &oi.Quantity, &oi.Price); err != nil {
+				itemRows.Close()
+				return nil, err
+			}
+			oi.ProductName = "Archived Item"
+			if nameNull.Valid {
+				oi.ProductName = nameNull.String
+			}
+			o.Items = append(o.Items, oi)
+		}
+		itemRows.Close()
 		orders = append(orders, o)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("storage.GetOrdersByUser: rows: %w", err)
-	}
-
 	return orders, nil
 }
 
-// AdminUpdateStock sets the stock level for a specific product to newStock.
-// newStock must be ≥ 0; the function returns an error for negative values
-// before touching the database.
-func AdminUpdateStock(ctx context.Context, db *sql.DB, productID string, newStock int) error {
-	if newStock < 0 {
-		return fmt.Errorf("storage.AdminUpdateStock: newStock must be >= 0, got %d", newStock)
-	}
-
-	const q = `UPDATE products SET stock = ? WHERE id = ?`
-
-	result, err := db.ExecContext(ctx, q, newStock, productID)
-	if err != nil {
-		return fmt.Errorf("storage.AdminUpdateStock: exec: %w", err)
-	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("storage.AdminUpdateStock: rows affected: %w", err)
-	}
-	if affected == 0 {
-		return fmt.Errorf("storage.AdminUpdateStock: product %q not found", productID)
-	}
-
-	return nil
+// UpdateOrderStatus mutates logistical progression state tags inside the terminal tracking system.
+func (db *DB) UpdateOrderStatus(id string, status string) error {
+	const query = `UPDATE orders SET status = ? WHERE id = ?`
+	_, err := db.ExecContext(db.Ctx, query, status, id)
+	return err
 }

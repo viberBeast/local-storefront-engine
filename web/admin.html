@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>STOREFRONT ADMIN CONTROL</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: monospace; background-color: #000; color: #fff; padding: 40px; font-size: 13px; }
+    header { border-bottom: 1px solid #333; padding-bottom: 20px; margin-bottom: 40px; display: flex; justify-content: space-between; align-items: flex-end; }
+    h1 { font-size: 14px; font-weight: normal; letter-spacing: 2px; }
+    .subtitle { color: #666; margin-top: 5px; }
+    
+    .config-box { background: #111; padding: 20px; border: 1px solid #222; margin-bottom: 30px; }
+    .config-row { display: flex; align-items: center; gap: 15px; }
+    input { background: #000; border: 1px solid #444; color: #fff; padding: 6px 10px; font-family: monospace; font-size: 12px; outline: none; }
+    input:focus { border-color: #888; }
+    
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th { text-align: left; padding: 12px; border-bottom: 2px solid #333; color: #aaa; font-weight: normal; }
+    td { padding: 16px 12px; border-bottom: 1px solid #222; vertical-align: middle; }
+    tr:hover td { background: #080808; }
+    
+    .action-btn { background: #fff; color: #000; border: none; padding: 6px 14px; font-family: monospace; cursor: pointer; font-weight: bold; }
+    .action-btn:hover { background: #ccc; }
+    .action-btn:disabled { background: #333; color: #666; cursor: not-allowed; }
+    
+    .toast { position: fixed; bottom: 30px; right: 30px; background: #fff; color: #000; padding: 12px 24px; font-weight: bold; display: none; }
+    .toast.show { display: block; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div>
+      <h1>INTERNAL INVENTORY MATRIX</h1>
+      <div class="subtitle">PRIVATE INTRA-NETWORK EDGE ROUTE POOL</div>
+    </div>
+    <div style="color: #00ff00; letter-spacing: 1px;">[ PRIVATE REGION SECURED ]</div>
+  </header>
+
+  <div class="config-box">
+    <div class="config-row">
+      <span>ADMIN SECRET TOKEN:</span>
+      <input type="password" id="admin-token" value="super-secret-dev-token" style="width: 250px;">
+    </div>
+  </div>
+
+  <table id="inventory-table">
+    <thead>
+      <tr>
+        <th>PRODUCT ID</th>
+        <th>NAME</th>
+        <th>CURRENT STOCK</th>
+        <th>UPDATE VALUES</th>
+      </tr>
+    </thead>
+    <tbody id="inventory-tbody">
+      <tr>
+        <td colspan="4" style="text-align: center; color: #666;">Querying database layer ledger assets...</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div id="toast-node" class="toast">STOCK BALANCED</div>
+
+  <script>
+    window.addEventListener('DOMContentLoaded', refreshLiveInventory);
+
+    function refreshLiveInventory() {
+      // Fetching catalog list directly from the public endpoint (since port 8080 shares the same DB)
+      fetch('/api/products')
+        .then(res => res.json())
+        .then(products => {
+          const tbody = document.getElementById('inventory-tbody');
+          tbody.innerHTML = '';
+          
+          if(!products || products.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: #666;">DATABASE PRESENTATION LAYER BLANK</td></tr>`;
+            return;
+          }
+
+          products.forEach(p => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td style="color: #666;">${p.id}</td>
+              <td style="font-weight: bold;">${p.name}</td>
+              <td><span id="stock-display-${p.id}">${p.stock}</span> units</td>
+              <td>
+                <input type="number" id="input-${p.id}" value="${p.stock}" style="width: 70px; margin-right: 10px;" min="0">
+                <button onclick="commitStockMutation('${p.id}')" class="action-btn">APPLY</button>
+              </td>
+            `;
+            tbody.appendChild(tr);
+          });
+        })
+        .catch(err => {
+          document.getElementById('inventory-tbody').innerHTML = `<tr><td colspan="4" style="text-align: center; color: red;">ERROR LOADING LEDGER: ${err.message}</td></tr>`;
+        });
+    }
+
+    function commitStockMutation(id) {
+      const token = document.getElementById('admin-token').value;
+      const newStock = parseInt(document.getElementById(`input-${id}`).value, 10);
+
+      if (isNaN(newStock) || newStock < 0) {
+        alert("Invalid inventory parameter");
+        return;
+      }
+
+      // Sends patch data cleanly to our administrative port route path
+      fetch('/admin/api/inventory', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Token': token
+        },
+        body: JSON.stringify({
+          product_id: id,
+          stock: newStock
+        })
+      })
+      .then(res => {
+        if (!res.ok) {
+          return res.json().then(e => { throw new Error(e.error || 'Access Denied') });
+        }
+        return res.json();
+      })
+      .then(data => {
+        document.getElementById(`stock-display-${id}`).textContent = newStock;
+        showToast(`MUTATION APPLIED: ${id} STOCK CHANGED`);
+      })
+      .catch(err => {
+        alert("MUTATION ERROR: " + err.message);
+      });
+    }
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast-node');
+      toast.textContent = msg;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2500);
+    }
+  </script>
+</body>
+</html>
