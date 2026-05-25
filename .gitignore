@@ -6,3 +6,9 @@ store-engine-android
 app
 engine
 .env
+# Binaries
+storefront-engine
+
+# SQLite temporary runtime files
+*.db-shm
+*.db-wal
