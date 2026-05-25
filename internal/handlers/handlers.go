@@ -71,6 +71,36 @@ func (h *Handler) GetProductsHandler(w http.ResponseWriter, r *http.Request) {
 	if products == nil {
 		products = []storage.Product{}
 	}
+
+	// ── DYNAMIC IMAGE ASSET MAPPING ────────────────────────────────────
+	// Computes clean asset path slugs based on lowercase product names
+	for i := range products {
+		if products[i].ImageURL == "" {
+			// Convert "IWC BIG PILOT'S WATCH" -> "iwc-big-pilot-s-watch"
+			cleanName := strings.ToLower(products[i].Name)
+			cleanName = strings.ReplaceAll(cleanName, " ", "-")
+			cleanName = strings.ReplaceAll(cleanName, "'", "-")
+			cleanName = strings.ReplaceAll(cleanName, "\"", "-")
+			cleanName = strings.ReplaceAll(cleanName, "/", "-")
+			cleanName = strings.ReplaceAll(cleanName, "(", "")
+			cleanName = strings.ReplaceAll(cleanName, ")", "")
+			cleanName = strings.ReplaceAll(cleanName, "--", "-")
+			
+			// Trim trailing or double dashes from formatting sanitization
+			cleanName = strings.Trim(cleanName, "-")
+			
+			// Map to your mounted dynamic disk folder route
+			products[i].ImageURL = "/images/" + cleanName + ".png"
+			
+			// Hardcode standard static fallback items if IDs match
+			if products[i].ID == "p1" {
+				products[i].ImageURL = "/images/brutalist-steel-chair.png"
+			} else if products[i].ID == "p2" {
+				products[i].ImageURL = "/images/concrete-desk-lamp.png"
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, products)
 }
 

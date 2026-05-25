@@ -1,0 +1,2271 @@
+=== CODEBASE SNAPSHOT GENERATED ON Sat May 23 06:42:12 PM IST 2026 ===
+
+=== PROJECT DIRECTORY STRUCTURE ===
+.
+├── codebase_snapshot.txt
+├── go.mod
+├── go.sum
+├── internal
+│   ├── handlers
+│   │   └── handlers.go
+│   ├── router
+│   │   └── router.go
+│   └── storage
+│       └── database.go
+├── main.go
+├── snapshot.sh
+└── web
+    ├── index.html
+    ├── public
+    │   ├── admin.html
+    │   └── style.css
+    └── static
+        └── style.css
+
+8 directories, 12 files
+
+=== SOURCE FILE CONTENTS ===
+
+--------------------------------------------------
+FILE: internal/storage/database.go
+--------------------------------------------------
+// Package storage provides database access functions for products and orders
+// using a pure-Go SQLite driver (modernc.org/sqlite) with no CGO dependency.
+package storage
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	_ "modernc.org/sqlite" // Pure-Go SQLite driver; registers as "sqlite"
+)
+
+// ─────────────────────────────────────────────
+// Domain structs
+// ─────────────────────────────────────────────
+
+// Product represents a sellable item in the catalogue.
+type Product struct {
+	ID          string
+	Name        string
+	Description string
+	Price       int // stored in smallest currency unit (e.g. paise / cents)
+	Stock       int
+}
+
+// Order represents a customer purchase header.
+type Order struct {
+	ID          string
+	UserEmail   string
+	TotalAmount int // smallest currency unit
+	Status      string
+	CreatedAt   time.Time
+}
+
+// OrderItem is a single line inside an Order.
+type OrderItem struct {
+	ID        int
+	OrderID   string
+	ProductID string
+	Quantity  int
+	Price     int // unit price at time of purchase
+}
+
+// ─────────────────────────────────────────────
+// Initialisation
+// ─────────────────────────────────────────────
+
+// InitDB opens (or creates) the SQLite database at dbPath, applies the
+// recommended WAL pragmas for high-concurrency workloads, and creates the
+// required tables if they do not yet exist.
+//
+// Connection-string pragmas used:
+//   - journal_mode=WAL  – enables concurrent readers + one writer
+//   - busy_timeout=5000 – wait up to 5 s before returning SQLITE_BUSY
+//
+// MaxOpenConns is set to 1 to serialise all writes through a single
+// connection and avoid "database is locked" errors that would otherwise
+// occur with multiple concurrent write connections to SQLite.
+func InitDB(dbPath string) (*sql.DB, error) {
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
+		dbPath,
+	)
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("storage.InitDB: open: %w", err)
+	}
+
+	// Serialise writes; SQLite supports only one concurrent writer.
+	db.SetMaxOpenConns(1)
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("storage.InitDB: ping: %w", err)
+	}
+
+	if err := createSchema(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("storage.InitDB: schema: %w", err)
+	}
+
+	return db, nil
+}
+
+// createSchema runs the DDL statements that set up the three core tables.
+// All statements use IF NOT EXISTS so they are safe to run on every start-up.
+func createSchema(db *sql.DB) error {
+	const ddl = `
+	CREATE TABLE IF NOT EXISTS products (
+		id          TEXT PRIMARY KEY,
+		name        TEXT    NOT NULL,
+		description TEXT    NOT NULL DEFAULT '',
+		price       INTEGER NOT NULL CHECK (price >= 0),
+		stock       INTEGER NOT NULL CHECK (stock >= 0)
+	);
+
+	CREATE TABLE IF NOT EXISTS orders (
+		id           TEXT    PRIMARY KEY,
+		user_email   TEXT    NOT NULL,
+		total_amount INTEGER NOT NULL CHECK (total_amount >= 0),
+		status       TEXT    NOT NULL DEFAULT 'pending',
+		created_at   TEXT    NOT NULL  -- stored as RFC3339 string
+	);
+
+	CREATE TABLE IF NOT EXISTS order_items (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		order_id   TEXT    NOT NULL REFERENCES orders(id)   ON DELETE CASCADE,
+		product_id TEXT    NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+		quantity   INTEGER NOT NULL CHECK (quantity > 0),
+		price      INTEGER NOT NULL CHECK (price >= 0)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_orders_user_email   ON orders(user_email);
+	CREATE INDEX IF NOT EXISTS idx_order_items_order   ON order_items(order_id);
+	CREATE INDEX IF NOT EXISTS idx_order_items_product ON order_items(product_id);
+	`
+
+	if _, err := db.Exec(ddl); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ─────────────────────────────────────────────
+// Query functions
+// ─────────────────────────────────────────────
+
+// GetAllProducts returns every product row from the database, ordered by name.
+// The caller supplies a context so the query can be cancelled or time-boxed.
+func GetAllProducts(ctx context.Context, db *sql.DB) ([]Product, error) {
+	const q = `
+		SELECT id, name, description, price, stock
+		FROM   products
+		ORDER  BY name ASC`
+
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("storage.GetAllProducts: query: %w", err)
+	}
+	defer rows.Close()
+
+	var products []Product
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Stock); err != nil {
+			return nil, fmt.Errorf("storage.GetAllProducts: scan: %w", err)
+		}
+		products = append(products, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage.GetAllProducts: rows: %w", err)
+	}
+
+	return products, nil
+}
+
+// CreateOrder inserts an Order header and all its OrderItems inside a single
+// ACID-compliant transaction.  The transaction is automatically rolled back if
+// any step fails; otherwise it is committed before returning.
+//
+// Note: order.CreatedAt is serialised to RFC3339 because SQLite has no native
+// DATETIME type; it is deserialised back to time.Time in GetOrdersByUser.
+func CreateOrder(ctx context.Context, db *sql.DB, order Order, items []OrderItem) error {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return fmt.Errorf("storage.CreateOrder: begin tx: %w", err)
+	}
+	// Ensure the transaction is always resolved – rolled back on any error path.
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// 1. Insert the order header.
+	const insertOrder = `
+		INSERT INTO orders (id, user_email, total_amount, status, created_at)
+		VALUES             (?,  ?,          ?,            ?,      ?         )`
+
+	if _, err = tx.ExecContext(ctx, insertOrder,
+		order.ID,
+		order.UserEmail,
+		order.TotalAmount,
+		order.Status,
+		order.CreatedAt.UTC().Format(time.RFC3339),
+	); err != nil {
+		return fmt.Errorf("storage.CreateOrder: insert order: %w", err)
+	}
+
+	// 2. Insert each line item.
+	const insertItem = `
+		INSERT INTO order_items (order_id, product_id, quantity, price)
+		VALUES                  (?,        ?,          ?,        ?    )`
+
+	for i, item := range items {
+		if _, err = tx.ExecContext(ctx, insertItem,
+			order.ID,
+			item.ProductID,
+			item.Quantity,
+			item.Price,
+		); err != nil {
+			return fmt.Errorf("storage.CreateOrder: insert item[%d]: %w", i, err)
+		}
+	}
+
+	// 3. Commit; any error here is surfaced to the caller.
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("storage.CreateOrder: commit: %w", err)
+	}
+	return nil
+}
+
+// GetOrdersByUser returns all orders placed by the given email address,
+// sorted newest-first.  created_at is parsed from its RFC3339 storage form
+// back into a time.Time value.
+func GetOrdersByUser(ctx context.Context, db *sql.DB, email string) ([]Order, error) {
+	const q = `
+		SELECT id, user_email, total_amount, status, created_at
+		FROM   orders
+		WHERE  user_email = ?
+		ORDER  BY created_at DESC`
+
+	rows, err := db.QueryContext(ctx, q, email)
+	if err != nil {
+		return nil, fmt.Errorf("storage.GetOrdersByUser: query: %w", err)
+	}
+	defer rows.Close()
+
+	var orders []Order
+	for rows.Next() {
+		var o Order
+		var createdAtStr string
+
+		if err := rows.Scan(
+			&o.ID, &o.UserEmail, &o.TotalAmount, &o.Status, &createdAtStr,
+		); err != nil {
+			return nil, fmt.Errorf("storage.GetOrdersByUser: scan: %w", err)
+		}
+
+		// Parse the RFC3339 string back to time.Time.
+		o.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
+		if err != nil {
+			return nil, fmt.Errorf("storage.GetOrdersByUser: parse time %q: %w", createdAtStr, err)
+		}
+
+		orders = append(orders, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage.GetOrdersByUser: rows: %w", err)
+	}
+
+	return orders, nil
+}
+
+// AdminUpdateStock sets the stock level for a specific product to newStock.
+// newStock must be ≥ 0; the function returns an error for negative values
+// before touching the database.
+func AdminUpdateStock(ctx context.Context, db *sql.DB, productID string, newStock int) error {
+	if newStock < 0 {
+		return fmt.Errorf("storage.AdminUpdateStock: newStock must be >= 0, got %d", newStock)
+	}
+
+	const q = `UPDATE products SET stock = ? WHERE id = ?`
+
+	result, err := db.ExecContext(ctx, q, newStock, productID)
+	if err != nil {
+		return fmt.Errorf("storage.AdminUpdateStock: exec: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("storage.AdminUpdateStock: rows affected: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("storage.AdminUpdateStock: product %q not found", productID)
+	}
+
+	return nil
+}
+
+--------------------------------------------------
+FILE: internal/handlers/handlers.go
+--------------------------------------------------
+package handlers
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"local-storefront-engine/internal/storage"
+)
+
+type OrderItem struct {
+	ProductID string `json:"product_id"`
+	Quantity  int    `json:"quantity"`
+}
+
+type checkoutPayload struct {
+	UserEmail string      `json:"user_email"`
+	Items     []OrderItem `json:"items"`
+}
+
+type Handler struct {
+	DB         any
+	adminToken string
+}
+
+func NewHandler(db any, adminToken string) (*Handler, error) {
+	if db == nil {
+		return nil, errors.New("handlers: database connection must not be nil")
+	}
+	if strings.TrimSpace(adminToken) == "" {
+		return nil, errors.New("handlers: adminToken must not be empty")
+	}
+	return &Handler{DB: db, adminToken: adminToken}, nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid payload structure")
+		return false
+	}
+	return true
+}
+
+func (h *Handler) GetProductsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	dbConn := h.DB.(*sql.DB)
+	products, err := storage.GetAllProducts(r.Context(), dbConn)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to retrieve products")
+		return
+	}
+	if products == nil {
+		products = []storage.Product{}
+	}
+	writeJSON(w, http.StatusOK, products)
+}
+
+func (h *Handler) PlaceOrderHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var payload checkoutPayload
+	if !decodeJSON(w, r, &payload) {
+		return
+	}
+	if strings.TrimSpace(payload.UserEmail) == "" || len(payload.Items) == 0 {
+		writeError(w, http.StatusUnprocessableEntity, "invalid email or empty items list")
+		return
+	}
+
+	var dbItems []storage.OrderItem
+	var totalAmount int
+	for _, item := range payload.Items {
+		dbItems = append(dbItems, storage.OrderItem{
+			ProductID: item.ProductID,
+			Quantity:  item.Quantity,
+			Price:     0,
+		})
+	}
+
+	orderId := "ord_" + string(time.Now().UnixNano())
+	order := storage.Order{
+		ID:          orderId,
+		UserEmail:   payload.UserEmail,
+		TotalAmount: totalAmount,
+		Status:      "pending",
+		CreatedAt:   time.Now().UTC(),
+	}
+
+	dbConn := h.DB.(*sql.DB)
+	err := storage.CreateOrder(r.Context(), dbConn, order, dbItems)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to build order record")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"id": orderId, "status": "pending"})
+}
+
+func (h *Handler) GetUserOrdersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	email := r.URL.Query().Get("q")
+	if email == "" {
+		cookie, err := r.Cookie("auth_token")
+		if err == nil {
+			email = cookie.Value
+		}
+	}
+	if strings.TrimSpace(email) == "" {
+		writeError(w, http.StatusUnauthorized, "missing email context parameter")
+		return
+	}
+
+	dbConn := h.DB.(*sql.DB)
+	orders, err := storage.GetOrdersByUser(r.Context(), dbConn, email)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load customer records")
+		return
+	}
+	if orders == nil {
+		orders = []storage.Order{}
+	}
+	writeJSON(w, http.StatusOK, orders)
+}
+
+func (h *Handler) AdminUpdateInventoryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	token := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+	if token != h.adminToken {
+		writeError(w, http.StatusForbidden, "unauthorized secret key context")
+		return
+	}
+	var mutation struct {
+		ProductID string `json:"product_id"`
+		Stock     int    `json:"stock"`
+	}
+	if !decodeJSON(w, r, &mutation) {
+		return
+	}
+
+	dbConn := h.DB.(*sql.DB)
+	err := storage.AdminUpdateStock(r.Context(), dbConn, mutation.ProductID, mutation.Stock)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed updating inventory limits")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "inventory update applied successfully"})
+}
+
+--------------------------------------------------
+FILE: internal/router/router.go
+--------------------------------------------------
+package router
+
+import (
+	"embed"
+	"io/fs"
+	"net/http"
+	"os"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"local-storefront-engine/internal/handlers"
+)
+
+var originSecret = os.Getenv("ORIGIN_SECRET")
+
+func NewRouter(h *handlers.Handler, embeddedFiles embed.FS) http.Handler {
+	r := chi.NewRouter()
+
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+	r.Use(enforceOriginSecret)
+
+	// ── HOME PAGE INTERCEPTOR ─────────────────────────────────────────────
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		indexBytes, err := embeddedFiles.ReadFile("web/index.html")
+		if err != nil {
+			http.Error(w, "Frontend root asset not found in embed tree", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(indexBytes)
+	})
+
+	// ── STYLESHEET INTERCEPTOR ────────────────────────────────────────────
+	// Intercepts the root style.css request and serves it safely from public
+	r.Get("/style.css", func(w http.ResponseWriter, r *http.Request) {
+		cssBytes, err := embeddedFiles.ReadFile("web/public/style.css")
+		if err != nil {
+			http.Error(w, "Stylesheet not found in embed tree", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cssBytes)
+	})
+
+	// ── PUBLIC API ENDPOINTS ───────────────────────────────────────────────
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Get("/products", h.GetProductsHandler)
+		r.Post("/orders", h.PlaceOrderHandler)
+		r.Get("/orders", h.GetUserOrdersHandler)
+
+		r.Patch("/admin/inventory", h.AdminUpdateInventoryHandler)
+	})
+
+	// ── STATIC EMBEDDED PATH MAPPINGS ──────────────────────────────────────
+	mountStaticDir(r, embeddedFiles, "/public", "web/public")
+	mountStaticDir(r, embeddedFiles, "/static", "web/static")
+
+	return r
+}
+
+func enforceOriginSecret(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if originSecret != "" && r.Header.Get("X-Origin-Secret") != originSecret {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func mountStaticDir(r chi.Router, embeddedFiles embed.FS, urlPrefix, fsRoot string) {
+	sub, err := fs.Sub(embeddedFiles, fsRoot)
+	if err != nil {
+		return
+	}
+
+	fileServer := http.FileServer(http.FS(sub))
+
+	r.Handle(
+		urlPrefix+"/*",
+		http.StripPrefix(urlPrefix, fileServer),
+	)
+}
+
+--------------------------------------------------
+FILE: web/public/admin.html
+--------------------------------------------------
+
+--------------------------------------------------
+FILE: web/public/style.css
+--------------------------------------------------
+/* ═══════════════════════════════════════════════════════════
+   STORE — brutalist stylesheet
+   companion to index.html
+   import: <link rel="stylesheet" href="style.css" />
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── TOKENS ──────────────────────────────────────────────── */
+:root {
+  --black:        #000000;
+  --white:        #ffffff;
+  --gray:         #c8c8c8;
+  --mid:          #888888;
+  --border:       2px solid #000000;
+  --font-display: 'Arial Black', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:    'Courier New', Courier, monospace;
+  --font-body:    'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --cart-w:       380px;
+}
+
+/* ── RESET ───────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing:  border-box;
+  margin:      0;
+  padding:     0;
+}
+
+html {
+  font-size:   14px;
+  background:  var(--white);
+  color:       var(--black);
+}
+
+body {
+  font-family: var(--font-body);
+  min-height:  100vh;
+  overflow-x:  hidden;
+}
+
+button  { cursor: pointer; font-family: inherit; }
+input   { font-family: var(--font-mono); }
+a       { color: inherit; text-decoration: none; }
+
+/* ── SCROLLBAR (webkit) ──────────────────────────────────── */
+::-webkit-scrollbar              { width: 4px; }
+::-webkit-scrollbar-track        { background: var(--white); }
+::-webkit-scrollbar-thumb        { background: var(--black); }
+::-webkit-scrollbar-thumb:hover  { background: #333; }
+
+/* ── HEADER ──────────────────────────────────────────────── */
+#header {
+  position:       sticky;
+  top:            0;
+  z-index:        100;
+  background:     var(--black);
+  color:          var(--white);
+  display:        flex;
+  align-items:    stretch;
+  border-bottom:  var(--border);
+}
+
+#header .logo {
+  font-family:    var(--font-display);
+  font-size:      1.15rem;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  padding:        14px 24px;
+  border-right:   1px solid #333;
+  flex-shrink:    0;
+}
+
+#header nav {
+  display:        flex;
+  align-items:    center;
+  padding:        0 24px;
+  gap:            2px;
+  flex:           1;
+}
+
+#header nav button {
+  background:     none;
+  border:         none;
+  color:          var(--gray);
+  font-family:    var(--font-mono);
+  font-size:      0.72rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  padding:        4px 10px;
+  transition:     color .1s;
+}
+
+#header nav button:hover,
+#header nav button.active  { color: var(--white); }
+
+#header nav button.active  { border-bottom: 2px solid var(--white); }
+
+#cart-toggle {
+  background:     none;
+  border:         none;
+  border-left:    1px solid #333;
+  color:          var(--white);
+  font-family:    var(--font-mono);
+  font-size:      0.72rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  padding:        14px 22px;
+  display:        flex;
+  align-items:    center;
+  gap:            10px;
+  flex-shrink:    0;
+}
+
+#cart-toggle:hover { background: #111; }
+
+#cart-badge {
+  background: var(--white);
+  color:      var(--black);
+  font-family: var(--font-display);
+  font-size:  0.65rem;
+  padding:    2px 6px;
+  display:    none;
+}
+
+#cart-badge.visible { display: inline-block; }
+
+/* ── LAYOUT ──────────────────────────────────────────────── */
+#app {
+  display:    flex;
+  min-height: calc(100vh - 49px);
+}
+
+main {
+  flex:    1;
+  padding: 0;
+}
+
+/* ── VIEWS ───────────────────────────────────────────────── */
+.view          { display: none; }
+.view.active   { display: block; }
+
+/* ── CATALOG HEADER ──────────────────────────────────────── */
+#catalog-header {
+  padding:       40px 40px 0;
+  border-bottom: var(--border);
+}
+
+#catalog-header h1 {
+  font-family:    var(--font-display);
+  font-size:      clamp(3rem, 8vw, 7rem);
+  letter-spacing: -0.02em;
+  text-transform: uppercase;
+  line-height:    0.9;
+  padding-bottom: 24px;
+}
+
+/* ── PRODUCT GRID ────────────────────────────────────────── */
+#product-grid {
+  display:               grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  border-left:           var(--border);
+}
+
+.product-card {
+  border-right:  var(--border);
+  border-bottom: var(--border);
+  cursor:        pointer;
+  background:    var(--white);
+  transition:    background .08s;
+}
+
+.product-card:hover                 { background: #f5f5f5; }
+.product-card:hover .card-add       { background: var(--black); color: var(--white); }
+
+.card-img {
+  width:           100%;
+  aspect-ratio:    1 / 1;
+  background:      #efefef;
+  border-bottom:   var(--border);
+  display:         flex;
+  align-items:     center;
+  justify-content: center;
+  overflow:        hidden;
+}
+
+.card-img img          { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+.card-img .img-placeholder {
+  font-family:    var(--font-display);
+  font-size:      4rem;
+  color:          var(--gray);
+  letter-spacing: -0.04em;
+}
+
+.card-body { padding: 16px 20px; }
+
+.card-name {
+  font-family:    var(--font-display);
+  font-size:      0.85rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom:  4px;
+}
+
+.card-sku {
+  font-family:    var(--font-mono);
+  font-size:      0.65rem;
+  color:          var(--mid);
+  letter-spacing: 0.1em;
+  margin-bottom:  12px;
+}
+
+.card-footer {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  border-top:      1px solid #e0e0e0;
+  padding:         12px 20px;
+}
+
+.card-price {
+  font-family:    var(--font-display);
+  font-size:      0.9rem;
+  letter-spacing: 0.04em;
+}
+
+.card-add {
+  background:     none;
+  border:         var(--border);
+  font-family:    var(--font-mono);
+  font-size:      0.65rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding:        6px 14px;
+  transition:     background .08s, color .08s;
+}
+
+.card-add:hover { background: var(--black); color: var(--white); }
+
+/* ── STATE MESSAGES ──────────────────────────────────────── */
+.state-msg {
+  grid-column:    1 / -1;
+  padding:        80px 40px;
+  font-family:    var(--font-mono);
+  font-size:      0.75rem;
+  letter-spacing: 0.15em;
+  color:          var(--mid);
+  text-transform: uppercase;
+}
+
+/* ── BACKDROP ────────────────────────────────────────────── */
+#backdrop {
+  position:   fixed;
+  inset:      0;
+  z-index:    150;
+  background: rgba(0, 0, 0, 0.4);
+  display:    none;
+}
+
+#backdrop.show { display: block; }
+
+/* ── CART PANEL ──────────────────────────────────────────── */
+#cart-panel {
+  position:  fixed;
+  top:       0;
+  right:     0;
+  width:     var(--cart-w);
+  height:    100vh;
+  background: var(--white);
+  border-left: var(--border);
+  z-index:   200;
+  display:   flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform .2s cubic-bezier(.4, 0, .2, 1);
+}
+
+#cart-panel.open { transform: translateX(0); }
+
+#cart-panel-header {
+  background:      var(--black);
+  color:           var(--white);
+  padding:         16px 22px;
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  border-bottom:   1px solid #333;
+  flex-shrink:     0;
+}
+
+#cart-panel-header h2 {
+  font-family:    var(--font-display);
+  font-size:      0.85rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+#cart-close {
+  background:  none;
+  border:      none;
+  color:       var(--white);
+  font-size:   1.4rem;
+  line-height: 1;
+  padding:     0 4px;
+}
+
+#cart-close:hover { color: var(--gray); }
+
+#cart-items {
+  flex:       1;
+  overflow-y: auto;
+}
+
+.cart-item {
+  display:     grid;
+  grid-template-columns: 60px 1fr auto;
+  gap:         14px;
+  align-items: center;
+  padding:     16px 22px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.cart-item-thumb {
+  width:           60px;
+  height:          60px;
+  background:      #efefef;
+  border:          1px solid #ccc;
+  display:         flex;
+  align-items:     center;
+  justify-content: center;
+  font-family:     var(--font-display);
+  font-size:       1.2rem;
+  color:           var(--gray);
+  flex-shrink:     0;
+  overflow:        hidden;
+}
+
+.cart-item-info   { min-width: 0; }
+
+.cart-item-name {
+  font-family:   var(--font-display);
+  font-size:     0.72rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  white-space:   nowrap;
+  overflow:      hidden;
+  text-overflow: ellipsis;
+}
+
+.cart-item-price {
+  font-family: var(--font-mono);
+  font-size:   0.7rem;
+  color:       var(--mid);
+  margin-top:  3px;
+}
+
+.cart-item-qty {
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+  margin-top:  8px;
+}
+
+.qty-btn {
+  background:      none;
+  border:          1px solid #ccc;
+  width:           22px;
+  height:          22px;
+  font-size:       0.9rem;
+  line-height:     1;
+  display:         flex;
+  align-items:     center;
+  justify-content: center;
+}
+
+.qty-btn:hover { border-color: var(--black); }
+
+.qty-val {
+  font-family: var(--font-mono);
+  font-size:   0.72rem;
+}
+
+.cart-item-remove {
+  background:  none;
+  border:      none;
+  font-size:   1.1rem;
+  color:       var(--mid);
+  align-self:  flex-start;
+  padding:     0;
+}
+
+.cart-item-remove:hover { color: var(--black); }
+
+.cart-empty-msg {
+  padding:        60px 22px;
+  font-family:    var(--font-mono);
+  font-size:      0.72rem;
+  letter-spacing: 0.15em;
+  color:          var(--mid);
+  text-transform: uppercase;
+}
+
+#cart-footer {
+  border-top:  var(--border);
+  padding:     22px;
+  flex-shrink: 0;
+}
+
+.cart-total-row {
+  display:         flex;
+  justify-content: space-between;
+  font-family:     var(--font-display);
+  font-size:       0.85rem;
+  letter-spacing:  0.1em;
+  text-transform:  uppercase;
+  margin-bottom:   18px;
+}
+
+#checkout-btn {
+  width:          100%;
+  background:     var(--black);
+  color:          var(--white);
+  border:         none;
+  font-family:    var(--font-display);
+  font-size:      0.8rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  padding:        16px;
+}
+
+#checkout-btn:hover    { background: #222; }
+#checkout-btn:disabled { background: var(--gray); cursor: not-allowed; }
+
+/* ── CHECKOUT OVERLAY ────────────────────────────────────── */
+#checkout-overlay {
+  position:        fixed;
+  inset:           0;
+  z-index:         300;
+  background:      rgba(0, 0, 0, 0.85);
+  display:         none;
+  align-items:     center;
+  justify-content: center;
+}
+
+#checkout-overlay.open { display: flex; }
+
+#checkout-modal {
+  background:  var(--white);
+  border:      var(--border);
+  width:       min(520px, 92vw);
+  max-height:  90vh;
+  overflow-y:  auto;
+}
+
+.modal-header {
+  background:      var(--black);
+  color:           var(--white);
+  padding:         18px 28px;
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  border-bottom:   1px solid #333;
+}
+
+.modal-header h2 {
+  font-family:    var(--font-display);
+  font-size:      0.85rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+#modal-close {
+  background:  none;
+  border:      none;
+  color:       var(--white);
+  font-size:   1.4rem;
+  line-height: 1;
+}
+
+#modal-close:hover { color: var(--gray); }
+
+.modal-body { padding: 32px 28px; }
+
+.field-group { margin-bottom: 22px; }
+
+.field-group label {
+  display:        block;
+  font-family:    var(--font-mono);
+  font-size:      0.65rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  margin-bottom:  8px;
+  color:          var(--mid);
+}
+
+.field-group input,
+.field-group select {
+  width:       100%;
+  border:      var(--border);
+  padding:     12px 14px;
+  font-family: var(--font-mono);
+  font-size:   0.85rem;
+  background:  var(--white);
+  color:       var(--black);
+  outline:     none;
+  appearance:  none;
+}
+
+.field-group input:focus,
+.field-group select:focus {
+  box-shadow: inset 0 0 0 1px var(--black);
+}
+
+.field-row {
+  display:               grid;
+  grid-template-columns: 1fr 1fr;
+  gap:                   16px;
+}
+
+.order-summary {
+  border:        1px solid #e0e0e0;
+  margin-bottom: 28px;
+}
+
+.order-summary-title {
+  padding:        10px 16px;
+  font-family:    var(--font-mono);
+  font-size:      0.65rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  border-bottom:  1px solid #e0e0e0;
+  color:          var(--mid);
+}
+
+.summary-line {
+  padding:         8px 16px;
+  display:         flex;
+  justify-content: space-between;
+  font-family:     var(--font-mono);
+  font-size:       0.75rem;
+  border-bottom:   1px solid #f0f0f0;
+}
+
+.summary-line:last-child { border-bottom: none; }
+
+.summary-line.total {
+  font-family:  var(--font-display);
+  font-size:    0.85rem;
+  border-top:   var(--border);
+  padding-top:  12px;
+}
+
+#place-order-btn {
+  width:          100%;
+  background:     var(--black);
+  color:          var(--white);
+  border:         none;
+  font-family:    var(--font-display);
+  font-size:      0.8rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  padding:        18px;
+  margin-top:     8px;
+}
+
+#place-order-btn:hover    { background: #222; }
+#place-order-btn:disabled { background: var(--gray); cursor: not-allowed; }
+
+.form-error {
+  font-family:    var(--font-mono);
+  font-size:      0.68rem;
+  color:          #cc0000;
+  letter-spacing: 0.05em;
+  margin-top:     8px;
+  display:        none;
+}
+
+.form-error.show { display: block; }
+
+/* ── ORDERS VIEW ─────────────────────────────────────────── */
+#orders-view { padding: 40px; }
+
+#orders-view h1 {
+  font-family:    var(--font-display);
+  font-size:      clamp(2rem, 5vw, 4rem);
+  letter-spacing: -0.02em;
+  text-transform: uppercase;
+  border-bottom:  var(--border);
+  padding-bottom: 20px;
+  margin-bottom:  32px;
+}
+
+.order-lookup {
+  display:      flex;
+  max-width:    460px;
+  border:       var(--border);
+  margin-bottom: 36px;
+}
+
+.order-lookup input {
+  flex:        1;
+  border:      none;
+  padding:     14px 18px;
+  font-family: var(--font-mono);
+  font-size:   0.85rem;
+  outline:     none;
+  background:  var(--white);
+}
+
+.order-lookup button {
+  background:     var(--black);
+  color:          var(--white);
+  border:         none;
+  border-left:    var(--border);
+  font-family:    var(--font-mono);
+  font-size:      0.7rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  padding:        14px 22px;
+  flex-shrink:    0;
+}
+
+.order-lookup button:hover { background: #222; }
+
+.orders-table {
+  width:           100%;
+  border-collapse: collapse;
+  font-family:     var(--font-mono);
+  font-size:       0.72rem;
+}
+
+.orders-table th {
+  text-align:     left;
+  padding:        10px 16px;
+  border-bottom:  var(--border);
+  font-size:      0.62rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color:          var(--mid);
+  background:     #fafafa;
+}
+
+.orders-table td {
+  padding:        14px 16px;
+  border-bottom:  1px solid #e8e8e8;
+  vertical-align: middle;
+}
+
+.orders-table tr:hover td { background: #fafafa; }
+
+.status-badge {
+  display:        inline-block;
+  font-size:      0.6rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding:        3px 8px;
+  border:         1px solid var(--black);
+}
+
+.status-badge.shipped   { background: var(--black); color: var(--white); }
+.status-badge.pending   { border-color: var(--gray); color: var(--mid); }
+.status-badge.delivered { background: #2a2a2a; color: var(--white); }
+.status-badge.cancelled { border-color: #ccc; color: #999; text-decoration: line-through; }
+
+/* ── SUCCESS STATE ───────────────────────────────────────── */
+#order-success {
+  text-align: center;
+  padding:    48px 28px;
+}
+
+#order-success .success-icon {
+  font-size:     2.5rem;
+  margin-bottom: 16px;
+}
+
+#order-success h3 {
+  font-family:    var(--font-display);
+  font-size:      1.1rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom:  10px;
+}
+
+#order-success p {
+  font-family:    var(--font-mono);
+  font-size:      0.75rem;
+  color:          var(--mid);
+  letter-spacing: 0.05em;
+  margin-bottom:  28px;
+}
+
+#order-success button {
+  background:     none;
+  border:         var(--border);
+  font-family:    var(--font-mono);
+  font-size:      0.7rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  padding:        10px 24px;
+}
+
+#order-success button:hover { background: var(--black); color: var(--white); }
+
+/* ── TOAST ───────────────────────────────────────────────── */
+#toast {
+  position:       fixed;
+  bottom:         28px;
+  left:           50%;
+  transform:      translateX(-50%) translateY(80px);
+  background:     var(--black);
+  color:          var(--white);
+  font-family:    var(--font-mono);
+  font-size:      0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding:        12px 28px;
+  border:         1px solid #333;
+  z-index:        500;
+  transition:     transform .22s cubic-bezier(.4, 0, .2, 1);
+  pointer-events: none;
+  white-space:    nowrap;
+}
+
+#toast.show { transform: translateX(-50%) translateY(0); }
+
+/* ── RESPONSIVE ──────────────────────────────────────────── */
+@media (max-width: 600px) {
+  :root { --cart-w: 100vw; }
+
+  #header .logo { font-size: 0.95rem; padding: 14px 16px; }
+  #catalog-header { padding: 24px 16px 0; }
+  #orders-view    { padding: 24px 16px; }
+  .modal-body     { padding: 24px 16px; }
+  .field-row      { grid-template-columns: 1fr; }
+
+  #product-grid {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  }
+}
+
+--------------------------------------------------
+FILE: web/static/style.css
+--------------------------------------------------
+
+--------------------------------------------------
+FILE: web/index.html
+--------------------------------------------------
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>STORE</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    /* ── RESET ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── TOKENS ─────────────────────────────────────────────── */
+    :root {
+      --black:   #000000;
+      --white:   #ffffff;
+      --gray:    #c8c8c8;
+      --mid:     #888888;
+      --border:  2px solid #000;
+      --font-display: 'Arial Black', 'Helvetica Neue', Arial, sans-serif;
+      --font-mono:    'Courier New', Courier, monospace;
+      --font-body:    'Helvetica Neue', Helvetica, Arial, sans-serif;
+      --cart-w: 380px;
+    }
+
+    /* ── BASE ────────────────────────────────────────────────── */
+    html { font-size: 14px; background: var(--white); color: var(--black); }
+    body { font-family: var(--font-body); min-height: 100vh; overflow-x: hidden; }
+    button { cursor: pointer; font-family: inherit; }
+    input  { font-family: var(--font-mono); }
+    a      { color: inherit; text-decoration: none; }
+
+    /* ── HEADER ──────────────────────────────────────────────── */
+    #header {
+      position: sticky; top: 0; z-index: 100;
+      background: var(--black); color: var(--white);
+      display: flex; align-items: stretch;
+      border-bottom: var(--border);
+    }
+    #header .logo {
+      font-family: var(--font-display);
+      font-size: 1.15rem; letter-spacing: 0.28em;
+      text-transform: uppercase;
+      padding: 14px 24px;
+      border-right: var(--border); border-color: #333;
+    }
+    #header nav {
+      display: flex; align-items: center;
+      padding: 0 24px; gap: 2px; flex: 1;
+    }
+    #header nav button {
+      background: none; border: none; color: var(--gray);
+      font-family: var(--font-mono); font-size: 0.72rem;
+      letter-spacing: 0.15em; text-transform: uppercase;
+      padding: 4px 10px;
+      transition: color .1s;
+    }
+    #header nav button:hover,
+    #header nav button.active { color: var(--white); }
+    #header nav button.active { border-bottom: 2px solid var(--white); }
+
+    #cart-toggle {
+      background: none; border: none; border-left: 1px solid #333;
+      color: var(--white); font-family: var(--font-mono);
+      font-size: 0.72rem; letter-spacing: 0.15em;
+      text-transform: uppercase;
+      padding: 14px 22px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    #cart-toggle:hover { background: #111; }
+    #cart-badge {
+      background: var(--white); color: var(--black);
+      font-family: var(--font-display); font-size: 0.65rem;
+      padding: 2px 6px;
+      display: none;
+    }
+    #cart-badge.visible { display: inline-block; }
+
+    /* ── LAYOUT ──────────────────────────────────────────────── */
+    #app { display: flex; min-height: calc(100vh - 49px); }
+    main { flex: 1; padding: 0; }
+
+    /* ── VIEWS ───────────────────────────────────────────────── */
+    .view { display: none; }
+    .view.active { display: block; }
+
+    /* ── CATALOG ─────────────────────────────────────────────── */
+    #catalog-header {
+      padding: 40px 40px 0;
+      border-bottom: var(--border);
+      margin-bottom: 0;
+    }
+    #catalog-header h1 {
+      font-family: var(--font-display);
+      font-size: clamp(3rem, 8vw, 7rem);
+      letter-spacing: -0.02em;
+      text-transform: uppercase;
+      line-height: 0.9;
+      padding-bottom: 24px;
+    }
+
+    #product-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      border-left: var(--border);
+    }
+    .product-card {
+      border-right: var(--border);
+      border-bottom: var(--border);
+      padding: 0;
+      cursor: pointer;
+      background: var(--white);
+      transition: background .08s;
+    }
+    .product-card:hover { background: #f5f5f5; }
+    .product-card:hover .card-add { background: var(--black); color: var(--white); }
+
+    .card-img {
+      width: 100%; aspect-ratio: 1/1;
+      background: #efefef;
+      border-bottom: var(--border);
+      display: flex; align-items: center; justify-content: center;
+      overflow: hidden;
+    }
+    .card-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .card-img .img-placeholder {
+      font-family: var(--font-display);
+      font-size: 4rem; color: var(--gray);
+      letter-spacing: -0.04em;
+    }
+    .card-body { padding: 16px 20px; }
+    .card-name {
+      font-family: var(--font-display);
+      font-size: 0.85rem; letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+    .card-sku {
+      font-family: var(--font-mono); font-size: 0.65rem;
+      color: var(--mid); letter-spacing: 0.1em;
+      margin-bottom: 12px;
+    }
+    .card-footer {
+      display: flex; align-items: center; justify-content: space-between;
+      border-top: 1px solid #e0e0e0; padding: 12px 20px;
+    }
+    .card-price {
+      font-family: var(--font-display); font-size: 0.9rem;
+      letter-spacing: 0.04em;
+    }
+    .card-add {
+      background: none; border: var(--border);
+      font-family: var(--font-mono); font-size: 0.65rem;
+      letter-spacing: 0.12em; text-transform: uppercase;
+      padding: 6px 14px;
+      transition: background .08s, color .08s;
+    }
+    .card-add:hover { background: var(--black); color: var(--white); }
+
+    /* ── EMPTY / LOADING ─────────────────────────────────────── */
+    .state-msg {
+      grid-column: 1/-1;
+      padding: 80px 40px;
+      font-family: var(--font-mono);
+      font-size: 0.75rem; letter-spacing: 0.15em;
+      color: var(--mid); text-transform: uppercase;
+    }
+
+    /* ── CART PANEL ──────────────────────────────────────────── */
+    #cart-panel {
+      position: fixed; top: 0; right: 0;
+      width: var(--cart-w); height: 100vh;
+      background: var(--white);
+      border-left: var(--border);
+      z-index: 200;
+      display: flex; flex-direction: column;
+      transform: translateX(100%);
+      transition: transform .2s cubic-bezier(.4,0,.2,1);
+    }
+    #cart-panel.open { transform: translateX(0); }
+
+    #cart-panel-header {
+      background: var(--black); color: var(--white);
+      padding: 16px 22px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: var(--border); border-color: #333;
+      flex-shrink: 0;
+    }
+    #cart-panel-header h2 {
+      font-family: var(--font-display);
+      font-size: 0.85rem; letter-spacing: 0.2em;
+      text-transform: uppercase;
+    }
+    #cart-close {
+      background: none; border: none; color: var(--white);
+      font-size: 1.4rem; line-height: 1;
+      padding: 0 4px;
+    }
+    #cart-close:hover { color: var(--gray); }
+
+    #cart-items {
+      flex: 1; overflow-y: auto;
+      padding: 0;
+    }
+    .cart-item {
+      display: grid; grid-template-columns: 60px 1fr auto;
+      gap: 14px; align-items: center;
+      padding: 16px 22px;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    .cart-item-thumb {
+      width: 60px; height: 60px;
+      background: #efefef;
+      border: 1px solid #ccc;
+      display: flex; align-items: center; justify-content: center;
+      font-family: var(--font-display); font-size: 1.2rem;
+      color: var(--gray); flex-shrink: 0;
+    }
+    .cart-item-info { min-width: 0; }
+    .cart-item-name {
+      font-family: var(--font-display);
+      font-size: 0.72rem; letter-spacing: 0.07em;
+      text-transform: uppercase;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .cart-item-price {
+      font-family: var(--font-mono); font-size: 0.7rem;
+      color: var(--mid); margin-top: 3px;
+    }
+    .cart-item-qty {
+      display: flex; align-items: center; gap: 8px;
+      margin-top: 8px;
+    }
+    .qty-btn {
+      background: none; border: 1px solid #ccc;
+      width: 22px; height: 22px; font-size: 0.9rem; line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .qty-btn:hover { border-color: var(--black); }
+    .qty-val { font-family: var(--font-mono); font-size: 0.72rem; }
+    .cart-item-remove {
+      background: none; border: none;
+      font-size: 1.1rem; color: var(--mid);
+      align-self: flex-start; padding: 0;
+    }
+    .cart-item-remove:hover { color: var(--black); }
+    .cart-empty-msg {
+      padding: 60px 22px;
+      font-family: var(--font-mono); font-size: 0.72rem;
+      letter-spacing: 0.15em; color: var(--mid);
+      text-transform: uppercase;
+    }
+
+    #cart-footer {
+      border-top: var(--border); padding: 22px;
+      flex-shrink: 0;
+    }
+    .cart-total-row {
+      display: flex; justify-content: space-between;
+      font-family: var(--font-display); font-size: 0.85rem;
+      letter-spacing: 0.1em; text-transform: uppercase;
+      margin-bottom: 18px;
+    }
+    #checkout-btn {
+      width: 100%; background: var(--black); color: var(--white);
+      border: none; font-family: var(--font-display);
+      font-size: 0.8rem; letter-spacing: 0.2em;
+      text-transform: uppercase; padding: 16px;
+    }
+    #checkout-btn:hover { background: #222; }
+    #checkout-btn:disabled { background: var(--gray); cursor: not-allowed; }
+
+    /* ── CHECKOUT OVERLAY ────────────────────────────────────── */
+    #checkout-overlay {
+      position: fixed; inset: 0; z-index: 300;
+      background: rgba(0,0,0,0.85);
+      display: none; align-items: center; justify-content: center;
+    }
+    #checkout-overlay.open { display: flex; }
+    #checkout-modal {
+      background: var(--white);
+      border: var(--border);
+      width: min(520px, 92vw);
+      max-height: 90vh; overflow-y: auto;
+    }
+    .modal-header {
+      background: var(--black); color: var(--white);
+      padding: 18px 28px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: var(--border); border-color: #333;
+    }
+    .modal-header h2 {
+      font-family: var(--font-display);
+      font-size: 0.85rem; letter-spacing: 0.2em;
+      text-transform: uppercase;
+    }
+    #modal-close {
+      background: none; border: none;
+      color: var(--white); font-size: 1.4rem; line-height: 1;
+    }
+    #modal-close:hover { color: var(--gray); }
+    .modal-body { padding: 32px 28px; }
+
+    .field-group { margin-bottom: 22px; }
+    .field-group label {
+      display: block;
+      font-family: var(--font-mono); font-size: 0.65rem;
+      letter-spacing: 0.2em; text-transform: uppercase;
+      margin-bottom: 8px; color: var(--mid);
+    }
+    .field-group input,
+    .field-group select {
+      width: 100%; border: var(--border);
+      padding: 12px 14px;
+      font-family: var(--font-mono); font-size: 0.85rem;
+      background: var(--white); color: var(--black);
+      outline: none;
+    }
+    .field-group input:focus,
+    .field-group select:focus { border-color: var(--black); box-shadow: inset 0 0 0 1px var(--black); }
+
+    .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+    .order-summary {
+      border: 1px solid #e0e0e0;
+      margin-bottom: 28px;
+    }
+    .order-summary-title {
+      padding: 10px 16px;
+      font-family: var(--font-mono); font-size: 0.65rem;
+      letter-spacing: 0.15em; text-transform: uppercase;
+      border-bottom: 1px solid #e0e0e0; color: var(--mid);
+    }
+    .summary-line {
+      padding: 8px 16px;
+      display: flex; justify-content: space-between;
+      font-family: var(--font-mono); font-size: 0.75rem;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .summary-line:last-child { border-bottom: none; }
+    .summary-line.total {
+      font-family: var(--font-display); font-size: 0.85rem;
+      border-top: var(--border); padding-top: 12px;
+    }
+
+    #place-order-btn {
+      width: 100%; background: var(--black); color: var(--white);
+      border: none; font-family: var(--font-display);
+      font-size: 0.8rem; letter-spacing: 0.2em;
+      text-transform: uppercase; padding: 18px;
+      margin-top: 8px;
+    }
+    #place-order-btn:hover { background: #222; }
+    #place-order-btn:disabled { background: var(--gray); cursor: not-allowed; }
+
+    .form-error {
+      font-family: var(--font-mono); font-size: 0.68rem;
+      color: #cc0000; letter-spacing: 0.05em;
+      margin-top: 8px; display: none;
+    }
+    .form-error.show { display: block; }
+
+    /* ── ORDERS VIEW ─────────────────────────────────────────── */
+    #orders-view { padding: 40px; }
+    #orders-view h1 {
+      font-family: var(--font-display);
+      font-size: clamp(2rem, 5vw, 4rem);
+      letter-spacing: -0.02em; text-transform: uppercase;
+      margin-bottom: 32px;
+      border-bottom: var(--border); padding-bottom: 20px;
+    }
+    .order-lookup {
+      display: flex; gap: 0; max-width: 460px;
+      border: var(--border); margin-bottom: 36px;
+    }
+    .order-lookup input {
+      flex: 1; border: none; padding: 14px 18px;
+      font-family: var(--font-mono); font-size: 0.85rem;
+      outline: none; background: var(--white);
+    }
+    .order-lookup button {
+      background: var(--black); color: var(--white);
+      border: none; border-left: var(--border);
+      font-family: var(--font-mono); font-size: 0.7rem;
+      letter-spacing: 0.15em; text-transform: uppercase;
+      padding: 14px 22px;
+    }
+    .order-lookup button:hover { background: #222; }
+
+    .orders-table {
+      width: 100%; border-collapse: collapse;
+      font-family: var(--font-mono); font-size: 0.72rem;
+    }
+    .orders-table th {
+      text-align: left;
+      padding: 10px 16px;
+      border-bottom: var(--border);
+      font-size: 0.62rem; letter-spacing: 0.18em;
+      text-transform: uppercase; color: var(--mid);
+      background: #fafafa;
+    }
+    .orders-table td {
+      padding: 14px 16px;
+      border-bottom: 1px solid #e8e8e8;
+      vertical-align: middle;
+    }
+    .orders-table tr:hover td { background: #fafafa; }
+
+    .status-badge {
+      display: inline-block;
+      font-size: 0.6rem; letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 3px 8px;
+      border: 1px solid var(--black);
+    }
+    .status-badge.shipped   { background: var(--black); color: var(--white); }
+    .status-badge.pending   { border-color: var(--gray); color: var(--mid); }
+    .status-badge.delivered { background: #2a2a2a; color: var(--white); }
+    .status-badge.cancelled { border-color: #ccc; color: #999; text-decoration: line-through; }
+
+    /* ── TOAST ───────────────────────────────────────────────── */
+    #toast {
+      position: fixed; bottom: 28px; left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: var(--black); color: var(--white);
+      font-family: var(--font-mono); font-size: 0.72rem;
+      letter-spacing: 0.12em; text-transform: uppercase;
+      padding: 12px 28px;
+      border: var(--border); border-color: #333;
+      z-index: 500;
+      transition: transform .22s cubic-bezier(.4,0,.2,1);
+      pointer-events: none;
+    }
+    #toast.show { transform: translateX(-50%) translateY(0); }
+
+    /* ── OVERLAY BACKDROP ────────────────────────────────────── */
+    #backdrop {
+      position: fixed; inset: 0; z-index: 150;
+      background: rgba(0,0,0,0.4);
+      display: none;
+    }
+    #backdrop.show { display: block; }
+
+    /* ── SUCCESS STATE ───────────────────────────────────────── */
+    #order-success {
+      text-align: center; padding: 48px 28px;
+    }
+    #order-success .success-icon {
+      font-size: 2.5rem; margin-bottom: 16px;
+    }
+    #order-success h3 {
+      font-family: var(--font-display);
+      font-size: 1.1rem; letter-spacing: 0.15em;
+      text-transform: uppercase; margin-bottom: 10px;
+    }
+    #order-success p {
+      font-family: var(--font-mono); font-size: 0.75rem;
+      color: var(--mid); letter-spacing: 0.05em;
+      margin-bottom: 28px;
+    }
+    #order-success button {
+      background: none; border: var(--border);
+      font-family: var(--font-mono); font-size: 0.7rem;
+      letter-spacing: 0.15em; text-transform: uppercase;
+      padding: 10px 24px;
+    }
+    #order-success button:hover { background: var(--black); color: var(--white); }
+  </style>
+</head>
+<body>
+
+  <!-- ── HEADER ──────────────────────────────────────────── -->
+  <header id="header">
+    <div class="logo">STORE</div>
+    <nav>
+      <button class="nav-btn active" data-view="catalog">Catalog</button>
+      <button class="nav-btn" data-view="orders">Orders</button>
+    </nav>
+    <button id="cart-toggle">
+      Cart
+      <span id="cart-badge">0</span>
+    </button>
+  </header>
+
+  <!-- ── MAIN ───────────────────────────────────────────── -->
+  <div id="app">
+    <main>
+
+      <!-- CATALOG VIEW -->
+      <section id="catalog-view" class="view active">
+        <div id="catalog-header">
+          <h1>Collection</h1>
+        </div>
+        <div id="product-grid">
+          <div class="state-msg">Loading—</div>
+        </div>
+      </section>
+
+      <!-- ORDERS VIEW -->
+      <section id="orders-view" class="view">
+        <h1>Order Tracking</h1>
+        <div class="order-lookup">
+          <input type="text" id="order-search" placeholder="Enter email or order ID" />
+          <button id="order-search-btn">Track</button>
+        </div>
+        <div id="orders-container">
+          <div class="state-msg" style="padding:0;color:var(--mid)">Enter an email or order ID above.</div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ── BACKDROP ───────────────────────────────────────── -->
+  <div id="backdrop"></div>
+
+  <!-- ── CART PANEL ─────────────────────────────────────── -->
+  <aside id="cart-panel">
+    <div id="cart-panel-header">
+      <h2>Cart (<span id="cart-count">0</span>)</h2>
+      <button id="cart-close">×</button>
+    </div>
+    <div id="cart-items">
+      <div class="cart-empty-msg">Your cart is empty.</div>
+    </div>
+    <div id="cart-footer">
+      <div class="cart-total-row">
+        <span>Total</span>
+        <span id="cart-total">$0.00</span>
+      </div>
+      <button id="checkout-btn" disabled>Proceed to Checkout</button>
+    </div>
+  </aside>
+
+  <!-- ── CHECKOUT OVERLAY ───────────────────────────────── -->
+  <div id="checkout-overlay">
+    <div id="checkout-modal">
+      <div class="modal-header">
+        <h2>Checkout</h2>
+        <button id="modal-close">×</button>
+      </div>
+      <div class="modal-body" id="checkout-form-wrap">
+        <div class="order-summary" id="checkout-summary">
+          <div class="order-summary-title">Order Summary</div>
+        </div>
+        <div class="field-group">
+          <label>Email Address</label>
+          <input type="email" id="f-email" placeholder="you@domain.com" autocomplete="email" />
+          <div class="form-error" id="err-email">A valid email is required.</div>
+        </div>
+        <div class="field-row">
+          <div class="field-group">
+            <label>First Name</label>
+            <input type="text" id="f-first" placeholder="First" autocomplete="given-name" />
+          </div>
+          <div class="field-group">
+            <label>Last Name</label>
+            <input type="text" id="f-last" placeholder="Last" autocomplete="family-name" />
+          </div>
+        </div>
+        <div class="field-group">
+          <label>Shipping Address</label>
+          <input type="text" id="f-addr" placeholder="Street address" autocomplete="street-address" />
+        </div>
+        <div class="field-row">
+          <div class="field-group">
+            <label>City</label>
+            <input type="text" id="f-city" placeholder="City" autocomplete="address-level2" />
+          </div>
+          <div class="field-group">
+            <label>Postal Code</label>
+            <input type="text" id="f-zip" placeholder="ZIP / Postcode" autocomplete="postal-code" />
+          </div>
+        </div>
+        <div class="field-group">
+          <label>Country</label>
+          <select id="f-country" autocomplete="country">
+            <option value="">— Select —</option>
+            <option>United States</option>
+            <option>United Kingdom</option>
+            <option>Canada</option>
+            <option>Germany</option>
+            <option>France</option>
+            <option>Japan</option>
+            <option>Australia</option>
+            <option>India</option>
+            <option>Other</option>
+          </select>
+        </div>
+        <p class="form-error" id="err-form" style="margin-bottom:12px">Please fill in all required fields.</p>
+        <button id="place-order-btn">Place Order</button>
+      </div>
+      <div id="order-success" style="display:none">
+        <div class="success-icon">◼</div>
+        <h3>Order Confirmed</h3>
+        <p id="success-msg">Your order has been placed.</p>
+        <button id="success-close">Continue Shopping</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TOAST ──────────────────────────────────────────── -->
+  <div id="toast"></div>
+
+  <script>
+  (() => {
+    'use strict';
+
+    // ── STATE ────────────────────────────────────────────
+    const state = {
+      products: [],
+      cart: [],       // [{ product, qty }]
+      loading: false,
+    };
+
+    // ── DOM REFS ─────────────────────────────────────────
+    const $ = id => document.getElementById(id);
+    const qs = sel => document.querySelector(sel);
+
+    const productGrid     = $('product-grid');
+    const cartPanel       = $('cart-panel');
+    const cartItems       = $('cart-items');
+    const cartCount       = $('cart-count');
+    const cartBadge       = $('cart-badge');
+    const cartTotal       = $('cart-total');
+    const checkoutBtn     = $('checkout-btn');
+    const checkoutOverlay = $('checkout-overlay');
+    const backdrop        = $('backdrop');
+    const toast           = $('toast');
+
+    // ── NAVIGATION ───────────────────────────────────────
+    document.querySelectorAll('.nav-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+        $(`${btn.dataset.view}-view`).classList.add('active');
+        closeCart();
+      });
+    });
+
+    // ── CART PANEL ───────────────────────────────────────
+    $('cart-toggle').addEventListener('click', openCart);
+    $('cart-close').addEventListener('click', closeCart);
+    backdrop.addEventListener('click', () => { closeCart(); closeCheckout(); });
+
+    function openCart() {
+      cartPanel.classList.add('open');
+      backdrop.classList.add('show');
+    }
+    function closeCart() {
+      cartPanel.classList.remove('open');
+      if (!checkoutOverlay.classList.contains('open')) backdrop.classList.remove('show');
+    }
+
+    // ── CHECKOUT OVERLAY ─────────────────────────────────
+    checkoutBtn.addEventListener('click', openCheckout);
+    $('modal-close').addEventListener('click', closeCheckout);
+    $('success-close').addEventListener('click', () => { closeCheckout(); closeCart(); });
+
+    function openCheckout() {
+      buildCheckoutSummary();
+      $('checkout-form-wrap').style.display = 'block';
+      $('order-success').style.display = 'none';
+      checkoutOverlay.classList.add('open');
+      backdrop.classList.add('show');
+    }
+    function closeCheckout() {
+      checkoutOverlay.classList.remove('open');
+      backdrop.classList.remove('show');
+    }
+
+    function buildCheckoutSummary() {
+      const sumEl = $('checkout-summary');
+      sumEl.innerHTML = '<div class="order-summary-title">Order Summary</div>';
+      state.cart.forEach(({ product, qty }) => {
+        const line = document.createElement('div');
+        line.className = 'summary-line';
+        line.innerHTML = `<span>${product.name} × ${qty}</span><span>${fmt(product.price * qty)}</span>`;
+        sumEl.appendChild(line);
+      });
+      const total = document.createElement('div');
+      total.className = 'summary-line total';
+      total.innerHTML = `<span>Total</span><span>${fmt(cartTotalValue())}</span>`;
+      sumEl.appendChild(total);
+    }
+
+    // ── FORM SUBMISSION ───────────────────────────────────
+    $('place-order-btn').addEventListener('click', async () => {
+      const email   = $('f-email').value.trim();
+      const first   = $('f-first').value.trim();
+      const last    = $('f-last').value.trim();
+      const addr    = $('f-addr').value.trim();
+      const city    = $('f-city').value.trim();
+      const zip     = $('f-zip').value.trim();
+      const country = $('f-country').value;
+
+      $('err-email').classList.remove('show');
+      $('err-form').classList.remove('show');
+
+      const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+      if (!emailValid) { $('err-email').classList.add('show'); return; }
+      if (!first || !last || !addr || !city || !zip || !country) {
+        $('err-form').classList.add('show'); return;
+      }
+
+      const btn = $('place-order-btn');
+      btn.disabled = true;
+      btn.textContent = 'Placing Order—';
+
+      try {
+        const payload = {
+          email, first_name: first, last_name: last,
+          address: addr, city, postal_code: zip, country,
+          items: state.cart.map(({ product, qty }) => ({
+            product_id: product.id, quantity: qty, price: product.price
+          }))
+        };
+        const res = await fetch('/api/v1/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || 'Order failed');
+
+        // success
+        state.cart = [];
+        renderCart();
+        $('checkout-form-wrap').style.display = 'none';
+        $('order-success').style.display = 'block';
+        $('success-msg').textContent =
+          `Order ${data.order_id || '#confirmed'} placed for ${email}`;
+      } catch (err) {
+        showToast(err.message || 'Error placing order');
+        btn.disabled = false;
+        btn.textContent = 'Place Order';
+      }
+    });
+
+    // ── PRODUCTS ─────────────────────────────────────────
+    async function loadProducts() {
+      productGrid.innerHTML = '<div class="state-msg">Loading—</div>';
+      try {
+        const res  = await fetch('/api/v1/products');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        state.products = Array.isArray(data) ? data : (data.products || []);
+        renderProducts();
+      } catch (err) {
+        productGrid.innerHTML =
+          `<div class="state-msg">Failed to load: ${esc(err.message)}</div>`;
+      }
+    }
+
+    function renderProducts() {
+      if (!state.products.length) {
+        productGrid.innerHTML = '<div class="state-msg">No products found.</div>';
+        return;
+      }
+      productGrid.innerHTML = '';
+      state.products.forEach(p => {
+        const card = document.createElement('div');
+        card.className = 'product-card';
+        const imgHtml = p.image_url
+          ? `<img src="${esc(p.image_url)}" alt="${esc(p.name)}" loading="lazy" />`
+          : `<span class="img-placeholder">${esc(p.name.slice(0,2).toUpperCase())}</span>`;
+
+        card.innerHTML = `
+          <div class="card-img">${imgHtml}</div>
+          <div class="card-body">
+            <div class="card-name">${esc(p.name)}</div>
+            <div class="card-sku">${esc(p.sku || p.id || '')}</div>
+          </div>
+          <div class="card-footer">
+            <span class="card-price">${fmt(p.price)}</span>
+            <button class="card-add" data-id="${esc(String(p.id))}">+ Add</button>
+          </div>`;
+        card.querySelector('.card-add').addEventListener('click', e => {
+          e.stopPropagation();
+          addToCart(p);
+        });
+        productGrid.appendChild(card);
+      });
+    }
+
+    // ── CART LOGIC ────────────────────────────────────────
+    function addToCart(product) {
+      const existing = state.cart.find(i => i.product.id === product.id);
+      if (existing) existing.qty += 1;
+      else state.cart.push({ product, qty: 1 });
+      renderCart();
+      showToast(`${product.name} — added`);
+      openCart();
+    }
+
+    function removeFromCart(productId) {
+      state.cart = state.cart.filter(i => i.product.id !== productId);
+      renderCart();
+    }
+
+    function updateQty(productId, delta) {
+      const item = state.cart.find(i => i.product.id === productId);
+      if (!item) return;
+      item.qty = Math.max(0, item.qty + delta);
+      if (item.qty === 0) removeFromCart(productId);
+      else renderCart();
+    }
+
+    function cartTotalValue() {
+      return state.cart.reduce((sum, { product, qty }) => sum + product.price * qty, 0);
+    }
+
+    function renderCart() {
+      const count = state.cart.reduce((s, i) => s + i.qty, 0);
+      cartCount.textContent = count;
+      cartBadge.textContent = count;
+      cartBadge.classList.toggle('visible', count > 0);
+      cartTotal.textContent = fmt(cartTotalValue());
+      checkoutBtn.disabled = count === 0;
+
+      if (!state.cart.length) {
+        cartItems.innerHTML = '<div class="cart-empty-msg">Your cart is empty.</div>';
+        return;
+      }
+      cartItems.innerHTML = '';
+      state.cart.forEach(({ product, qty }) => {
+        const el = document.createElement('div');
+        el.className = 'cart-item';
+        const thumb = product.image_url
+          ? `<img src="${esc(product.image_url)}" alt="" style="width:100%;height:100%;object-fit:cover">`
+          : `${esc(product.name.slice(0,2).toUpperCase())}`;
+        el.innerHTML = `
+          <div class="cart-item-thumb">${thumb}</div>
+          <div class="cart-item-info">
+            <div class="cart-item-name">${esc(product.name)}</div>
+            <div class="cart-item-price">${fmt(product.price)} each</div>
+            <div class="cart-item-qty">
+              <button class="qty-btn" data-action="dec" data-id="${product.id}">−</button>
+              <span class="qty-val">${qty}</span>
+              <button class="qty-btn" data-action="inc" data-id="${product.id}">+</button>
+            </div>
+          </div>
+          <button class="cart-item-remove" data-id="${product.id}" title="Remove">×</button>`;
+        el.querySelector('.cart-item-remove').addEventListener('click', () => removeFromCart(product.id));
+        el.querySelectorAll('.qty-btn').forEach(btn => {
+          btn.addEventListener('click', () => updateQty(product.id, btn.dataset.action === 'inc' ? 1 : -1));
+        });
+        cartItems.appendChild(el);
+      });
+    }
+
+    // ── ORDERS ───────────────────────────────────────────
+    $('order-search-btn').addEventListener('click', loadOrders);
+    $('order-search').addEventListener('keydown', e => { if (e.key === 'Enter') loadOrders(); });
+
+    async function loadOrders() {
+      const query = $('order-search').value.trim();
+      if (!query) { showToast('Enter an email or order ID'); return; }
+      const container = $('orders-container');
+      container.innerHTML = '<div class="state-msg" style="padding:0">Loading—</div>';
+      try {
+        const url = `/api/v1/orders?q=${encodeURIComponent(query)}`;
+        const res  = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const orders = Array.isArray(data) ? data : (data.orders || []);
+        renderOrders(orders, container);
+      } catch (err) {
+        container.innerHTML =
+          `<div class="state-msg" style="padding:0">Error: ${esc(err.message)}</div>`;
+      }
+    }
+
+    function renderOrders(orders, container) {
+      if (!orders.length) {
+        container.innerHTML = '<div class="state-msg" style="padding:0">No orders found.</div>';
+        return;
+      }
+      const table = document.createElement('table');
+      table.className = 'orders-table';
+      table.innerHTML = `
+        <thead>
+          <tr>
+            <th>Order ID</th>
+            <th>Date</th>
+            <th>Items</th>
+            <th>Total</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>`;
+      const tbody = table.querySelector('tbody');
+      orders.forEach(o => {
+        const tr = document.createElement('tr');
+        const dateStr = o.created_at
+          ? new Date(o.created_at).toLocaleDateString('en-US', { year:'numeric', month:'short', day:'numeric' })
+          : '—';
+        const statusClass = (o.status || '').toLowerCase().replace(/\s+/g, '-');
+        tr.innerHTML = `
+          <td>${esc(String(o.id || o.order_id || '—'))}</td>
+          <td>${dateStr}</td>
+          <td>${esc(String(o.item_count || (o.items && o.items.length) || '—'))}</td>
+          <td>${o.total != null ? fmt(o.total) : '—'}</td>
+          <td><span class="status-badge ${statusClass}">${esc(o.status || 'Unknown')}</span></td>`;
+        tbody.appendChild(tr);
+      });
+      container.innerHTML = '';
+      container.appendChild(table);
+    }
+
+    // ── TOAST ─────────────────────────────────────────────
+    let toastTimer;
+    function showToast(msg) {
+      toast.textContent = msg;
+      toast.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove('show'), 2400);
+    }
+
+    // ── HELPERS ───────────────────────────────────────────
+    function fmt(n) {
+      return new Intl.NumberFormat('en-US', { style:'currency', currency:'USD' }).format(n || 0);
+    }
+    function esc(str) {
+      return String(str)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    // ── BOOT ──────────────────────────────────────────────
+    loadProducts();
+    renderCart();
+  })();
+  </script>
+</body>
+</html>

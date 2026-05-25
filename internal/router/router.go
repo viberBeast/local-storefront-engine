@@ -34,7 +34,6 @@ func NewRouter(h *handlers.Handler, embeddedFiles embed.FS) http.Handler {
 	})
 
 	// ── STYLESHEET INTERCEPTOR ────────────────────────────────────────────
-	// Intercepts the root style.css request and serves it safely from public
 	r.Get("/style.css", func(w http.ResponseWriter, r *http.Request) {
 		cssBytes, err := embeddedFiles.ReadFile("web/public/style.css")
 		if err != nil {
@@ -54,6 +53,11 @@ func NewRouter(h *handlers.Handler, embeddedFiles embed.FS) http.Handler {
 
 		r.Patch("/admin/inventory", h.AdminUpdateInventoryHandler)
 	})
+
+	// ── LIVE ASSETS FROM DISK (ADORN TAP / YEEZY IMAGES) ──────────────────
+	// Serves files from disk dynamically instead of embedding heavy binaries
+	imageDir := "/home/somo/adorntap_raw_data/images"
+	r.Handle("/images/*", http.StripPrefix("/images", http.FileServer(http.Dir(imageDir))))
 
 	// ── STATIC EMBEDDED PATH MAPPINGS ──────────────────────────────────────
 	mountStaticDir(r, embeddedFiles, "/public", "web/public")

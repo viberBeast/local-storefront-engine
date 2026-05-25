@@ -17,11 +17,12 @@ import (
 
 // Product represents a sellable item in the catalogue.
 type Product struct {
-	ID          string
-	Name        string
-	Description string
-	Price       int // stored in smallest currency unit (e.g. paise / cents)
-	Stock       int
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Price       int    `json:"price"`
+	Stock       int    `json:"stock"`
+	ImageURL    string `json:"image_url"`
 }
 
 // Order represents a customer purchase header.
